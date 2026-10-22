@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ai-stock-research-platform
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/v1/system/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: TAPETIDE_TOKEN
+        value: tpt_rt_5fd4dc6df4e461b1fd56cb9a17b48eda43e830533c526e3dce7c4deb
+      - key: FINNHUB_API_KEY
+        value: dbd2c61r01qutcrq9e3gdbd2c61r01qutcrq9e40
