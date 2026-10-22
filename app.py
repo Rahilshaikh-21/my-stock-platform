@@ -358,14 +358,21 @@ async def sync_dhan_live_holdings_into_portfolio() -> int:
                         qty = _extract_numeric(item, ["totalQty", "availableQty", "dpQty"]) or 0.0
                         avg_cost = _extract_numeric(item, ["avgCostPrice", "buyAvg"]) or 0.0
                         if sym and qty > 0:
-                            PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p["symbol"].upper() != sym]
-                            PORTFOLIO_STORE.append({
-                                "symbol": sym,
-                                "exchange": "NSE",
-                                "quantity": round(qty, 2),
-                                "avg_buy_price": round(avg_cost, 2),
-                            })
-                            imported += 1
+                            # Google Sheet/manual position is the source of truth when a
+                            # symbol already exists. Dhan must not overwrite its quantity
+                            # or weighted-average cost (the old behavior replaced both).
+                            existing = next(
+                                (p for p in PORTFOLIO_STORE if p.get("symbol", "").upper() == sym),
+                                None,
+                            )
+                            if existing is None:
+                                PORTFOLIO_STORE.append({
+                                    "symbol": sym,
+                                    "exchange": "NSE",
+                                    "quantity": round(qty, 2),
+                                    "avg_buy_price": round(avg_cost, 2),
+                                })
+                                imported += 1
     except Exception:
         pass
     return imported
@@ -1820,19 +1827,25 @@ async def get_portfolio():
         if live:
             curr_p = live["price"]
             qty = float(pos["quantity"] or 1.0)
-            avg_cost = float(pos["avg_buy_price"]) if float(pos["avg_buy_price"]) > 0 else curr_p
-            inv = round(qty * avg_cost, 2)
+            raw_avg_cost = float(pos.get("avg_buy_price") or 0.0)
+            has_cost_basis = raw_avg_cost > 0
+            # Never substitute live price for missing cost basis: that falsely
+            # reports zero P&L. Keep current market value visible, but mark P&L unknown.
+            avg_cost = round(raw_avg_cost, 2) if has_cost_basis else None
+            inv = round(qty * raw_avg_cost, 2) if has_cost_basis else None
             cur_val = round(qty * curr_p, 2)
-            pnl = round(cur_val - inv, 2)
-            pnl_pct = round((pnl / inv) * 100.0, 2) if inv > 0 else 0.0
+            pnl = round(cur_val - inv, 2) if has_cost_basis else None
+            pnl_pct = round((pnl / inv) * 100.0, 2) if has_cost_basis and inv > 0 else None
             fx = 1.0 if live["country"] == "IN" else usd_to_inr
-            tot_inv_inr += inv * fx
+            if has_cost_basis:
+                tot_inv_inr += inv * fx
             tot_cur_inr += cur_val * fx
             enriched.append({
                 "symbol": live["symbol"],
                 "exchange": live["exchange"],
                 "quantity": qty,
                 "avg_buy_price": avg_cost,
+                "has_cost_basis": has_cost_basis,
                 "live_data": live,
                 "invested": inv,
                 "current_value": cur_val,
@@ -2582,9 +2595,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
         return `<tr class="hover:bg-slate-800/40">
           <td onclick="openEvidenceModal('${s.symbol}')" class="py-2.5 px-2 font-bold text-white cursor-pointer">${s.symbol} <div class="text-[11px] font-normal text-slate-400">${s.name}</div></td>
           <td class="py-2.5 px-2 text-right font-mono">${p.quantity}</td>
-          <td class="py-2.5 px-2 text-right font-mono">${s.currency_symbol}${p.avg_buy_price.toLocaleString()}</td>
+          <td class="py-2.5 px-2 text-right font-mono">${p.has_cost_basis ? `${s.currency_symbol}${Number(p.avg_buy_price).toLocaleString()}` : '<span class="text-amber-300">Missing cost</span>'}</td>
           <td class="py-2.5 px-2 text-right font-mono font-bold text-white">${s.currency_symbol}${s.price.toLocaleString()}</td>
-          <td class="py-2.5 px-2 text-right font-mono font-bold ${p.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${p.pnl >= 0 ? '+' : ''}${s.currency_symbol}${p.pnl.toLocaleString()} (${p.pnl_pct}%)</td>
+          <td class="py-2.5 px-2 text-right font-mono font-bold ${p.pnl == null ? 'text-amber-300' : (p.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400')}">${p.pnl == null ? 'P&L N/A' : `${p.pnl >= 0 ? '+' : ''}${s.currency_symbol}${p.pnl.toLocaleString()} (${p.pnl_pct}%)`}</td>
           <td class="py-2.5 px-2 text-right font-mono text-rose-300">${s.currency_symbol}${s.sell_trigger_limit.toLocaleString()}</td>
           <td class="py-2.5 px-2">${signalPillHtml(s.action_badge)}</td>
           <td class="py-2.5 px-2 text-right space-x-2">
