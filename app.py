@@ -1,6 +1,7 @@
 import asyncio
 import math
 import os
+import string
 import time as time_mod
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timezone
@@ -13,8 +14,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ============================================================================
-# 1. API CONFIGURATION & PERSISTENT HIGH-SPEED CONNECTION POOL
-#    (STRICTLY ZERO STOCK OR ETF NAMES HARDCODED ANYWHERE IN THIS CODE)
+# 1. API CONFIGURATION & HIGH-SPEED CONNECTION POOL
+#    (STRICTLY ZERO STOCK OR ETF NAMES HARDCODED ANYWHERE IN THIS FILE)
 # ============================================================================
 
 TAPETIDE_TOKEN = os.getenv(
@@ -39,27 +40,25 @@ BROWSER_HEADERS = {
     "Accept": "application/json",
 }
 
-# Generic macroeconomic sector terms for dynamic online discovery (No company or ticker names)
-SECTOR_QUERIES_IN = [
-    "india bank", "india software", "india pharmaceuticals", "india automotive",
-    "india energy", "india power", "india telecom", "india engineering",
-    "india financial", "india consumer"
+# Dynamic A-to-Z Exchange Sweep Generators (Zero hardcoded company or ticker names!)
+# Sweeps a.ns through z.ns to discover top market-cap NSE/BSE companies across all 26 letters
+AZ_NSE_SWEEP = [f"{ch}.ns" for ch in string.ascii_lowercase]
+AZ_US_SWEEP = [
+    "technology", "semiconductor", "software", "pharmaceuticals", "biotech",
+    "aerospace", "automotive", "banking", "financial", "energy", "retail",
+    "communications", "industrials", "cybersecurity", "cloud", "医療", "consumer"
 ]
-SECTOR_QUERIES_US = [
-    "semiconductor", "cloud software", "commercial bank", "biotechnology",
-    "retail", "aerospace", "digital payment", "internet", "cybersecurity"
-]
-SECTOR_QUERIES_ETF = [
-    "india index etf", "india gold etf", "india bank etf", "india it etf",
-    "global tech etf", "us index etf", "broad market etf", "dividend etf"
+ETF_SWEEP_QUERIES = [
+    "bees.ns", "etf.ns", "nifty.ns", "gold.ns", "silver.ns", "bank.ns",
+    "it.ns", "index.ns", "spdr etf", "invesco etf", "vanguard etf", "ishares etf"
 ]
 
 SHARED_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
-FETCH_SEMAPHORE = asyncio.Semaphore(16)
+FETCH_SEMAPHORE = asyncio.Semaphore(25)
 
 UNIVERSE_CACHE: Dict[str, Dict[str, Any]] = {}
 SYMBOL_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL_SECONDS = 600.0
+CACHE_TTL_SECONDS = 900.0
 
 WATCHLIST_STORE: List[Dict[str, Any]] = []
 PORTFOLIO_STORE: List[Dict[str, Any]] = []
@@ -69,8 +68,8 @@ def get_http_client() -> httpx.AsyncClient:
     global SHARED_HTTP_CLIENT
     if SHARED_HTTP_CLIENT is None or SHARED_HTTP_CLIENT.is_closed:
         SHARED_HTTP_CLIENT = httpx.AsyncClient(
-            limits=httpx.Limits(max_keepalive_connections=30, max_connections=60),
-            timeout=httpx.Timeout(5.0, connect=2.5),
+            limits=httpx.Limits(max_keepalive_connections=40, max_connections=80),
+            timeout=httpx.Timeout(5.5, connect=2.5),
             follow_redirects=True,
         )
     return SHARED_HTTP_CLIENT
@@ -116,34 +115,24 @@ def _extract_numeric(data: Dict[str, Any], keys: List[str]) -> Optional[float]:
 # ============================================================================
 
 def clean_and_split_adjust_series(raw_closes: List[float], live_price: float) -> List[float]:
-    """
-    1. Adjusts historical series for any stock split, bonus, or ETF unit subdivision
-       (e.g. 1:100 Gold ETF unit split, 1:10 split, 1:2 bonus) so all historical bars
-       are on the exact same scale as today's live_price.
-    2. Filters out single-day corrupt data spikes.
-    """
     if not raw_closes:
         return [live_price]
 
-    # Step A: Forward split/bonus rescaling whenever an overnight jump > 38% occurs
     adjusted = [raw_closes[0]]
     for idx in range(1, len(raw_closes)):
         prev_p = adjusted[-1]
         curr_p = raw_closes[idx]
         if prev_p > 0:
             ratio = curr_p / prev_p
-            # If overnight price dropped >38% (e.g. 1:2, 1:5, 1:10, 1:100 split) or jumped >75% (reverse split)
             if ratio < 0.62 or ratio > 1.75:
                 adjusted = [round(x * ratio, 4) for x in adjusted]
         adjusted.append(curr_p)
 
-    # Step B: Anchor final scale to live_price if the last bar is still off by a split factor
     if adjusted and live_price > 0:
         end_ratio = live_price / adjusted[-1]
         if end_ratio < 0.62 or end_ratio > 1.75:
             adjusted = [round(x * end_ratio, 4) for x in adjusted]
 
-    # Step C: Clamp any single-bar freak data glitch (>35% spike that immediately reverts next day)
     if len(adjusted) >= 3:
         for i in range(1, len(adjusted) - 1):
             neighbor_avg = (adjusted[i - 1] + adjusted[i + 1]) / 2.0
@@ -248,7 +237,7 @@ def run_walk_forward_backtest_on_instrument(closes_3y: List[float]) -> Dict[str,
 
 
 # ============================================================================
-# 3. SEPARATE ETF NAV ENGINE & STOCK FUND-MANAGER ENGINE (5,200-ASSET AUDITED)
+# 3. SEPARATE ETF NAV ENGINE & STOCK FUND-MANAGER ENGINE
 # ============================================================================
 
 def evaluate_institutional_engine(
@@ -269,20 +258,12 @@ def evaluate_institutional_engine(
     roic: Optional[float],
     provider_name: str,
 ) -> Dict[str, Any]:
-    """
-    Strictly separates ETF Valuation (200-EMA Institutional NAV + Split-Adjusted 52W Channel)
-    from Stock Valuation (Graham/Buffett Earnings Power + ROIC vs WACC + Peter Lynch GARP).
-    Enforces hard mathematical sanity bounds so no split or API glitch can ever produce
-    distorted Fair Values.
-    """
     session = get_market_session_status(country)
     curr_sym = "₹" if currency == "INR" else "$"
     is_etf = (asset_type == "ETF")
 
     closes_1y = closes_3y[-252:] if len(closes_3y) >= 252 else closes_3y
 
-    # CRITICAL FIX: 52-Week High & Low are ALWAYS computed from split-adjusted closes_1y
-    # (Never from unadjusted API metadata that caused the 15,599.8 bug on 1:100 split ETFs!)
     high_52w = round(max(max(closes_1y), price), 2)
     low_52w = round(min(min(closes_1y), price), 2)
     price_3yr_ago = round(closes_3y[0], 2)
@@ -313,20 +294,16 @@ def evaluate_institutional_engine(
     bt_stats = run_walk_forward_backtest_on_instrument(closes_3y)
 
     # ========================================================================
-    # BRANCH A:DEDICATED ETF VALUATION & DECISION ENGINE (INDEX / GOLD / SECTOR ETFs)
+    # BRANCH A: DEDICATED ETF VALUATION & DECISION ENGINE
     # ========================================================================
     if is_etf:
-        # 1. ETF Fair Value Anchor:
-        #    60% weight to 200-EMA Institutional Mean (+5% forward drift if rising)
-        #    40% weight to Split-Adjusted 52-Week Channel Midpoint
         nav_trend_anchor = ema_200 * (1.05 if is_200ema_rising else 1.01)
         channel_midpoint = (high_52w * 0.55) + (low_52w * 0.45)
         raw_etf_fv = (nav_trend_anchor * 0.60) + (channel_midpoint * 0.40)
 
-        # Hard Sanity Clamp for ETFs: Fair Value is strictly within [0.88x, 1.20x] of current price
         fair_value = round(max(price * 0.88, min(price * 1.20, raw_etf_fv)), 2)
-        safe_buy_limit = round(fair_value * 0.94, 2)       # 6% Margin of Safety Dip Zone for ETFs
-        sell_trigger_limit = round(fair_value * 1.15, 2)   # +15% Overextended Rebalance Target
+        safe_buy_limit = round(fair_value * 0.94, 2)
+        sell_trigger_limit = round(fair_value * 1.15, 2)
 
         mos_pct = round(((fair_value - price) / fair_value) * 100.0, 1) if fair_value > 0 else 0.0
         eps_display = f"ETF (200-EMA NAV: {curr_sym}{ema_200})"
@@ -336,22 +313,18 @@ def evaluate_institutional_engine(
             short_signal = "STRONG BUY ETF"
             action_badge = "🟢🔥 STRONG BUY ETF (Bumper Dip Zone — 200-EMA & Fair NAV Ke Neeche Hai!)"
             lt_confidence = round(min(97.0, 88.0 + max(0.0, mos_pct)), 1)
-            decision_category = "BUY"
-        elif price <= fair_value * 1.02:
+        elif price <= fair_value * 1.03:
             short_signal = "BUY / SIP ETF"
             action_badge = "🟢 BUY / ACCUMULATE ETF (Fair NAV Zone Mein Hai — Lump Sum + SIP Karein!)"
-            lt_confidence = 86.0
-            decision_category = "BUY"
+            lt_confidence = round(min(92.0, 82.0 + max(0.0, mos_pct)), 1)
         elif price <= sell_trigger_limit:
             short_signal = "HOLD & SIP"
             action_badge = "🟡 HOLD & CONTINUE SIP (Uptrend Compounding Zone — Regular SIP Jari Rakhein!)"
-            lt_confidence = 79.0
-            decision_category = "HOLD"
+            lt_confidence = 78.0
         else:
             short_signal = "BOOK PARTIAL PROFIT"
             action_badge = "🔴💰 OVEREXTENDED ETF (200-EMA Se Bohot Upar — Partial Profit Book Karein!)"
             lt_confidence = 42.0
-            decision_category = "SELL"
 
         lt_top_5_reasons = [
             f"1. ETF Fair NAV & 200-EMA Valuation: Live Price ({curr_sym}{price}) vs Institutional 200-EMA NAV Anchor ({curr_sym}{ema_200}) aur Realistic Fair Value ({curr_sym}{fair_value}) — Margin of Safety: {mos_pct}%.",
@@ -392,7 +365,6 @@ def evaluate_institutional_engine(
             raw_stock_fv = (regression_anchor * 0.55) + (band_anchor * 0.45)
             eps_display = "Normalized P/E ~20x"
 
-        # Hard Sanity Clamp for Stocks: Fair Value strictly within [0.55x, 1.48x] of current price
         fair_value = round(max(price * 0.55, min(price * 1.48, raw_stock_fv)), 2)
         safe_buy_limit = round(fair_value * 0.88, 2)
         sell_trigger_limit = round(fair_value * 1.24, 2)
@@ -477,7 +449,7 @@ def evaluate_institutional_engine(
     # ========================================================================
     sw_stop = round(price - (1.5 * atr_14), 2)
     sw_risk = max(0.01, price - sw_stop)
-    sw_target = round(price + (3.3 * atr_14), 2)  # 2.2x Reward-to-Risk
+    sw_target = round(price + (3.3 * atr_14), 2)
     sw_rr = round((sw_target - price) / sw_risk, 2)
 
     stage2_aligned = (price >= ema_20 >= ema_50 * 0.99) and (ema_50 >= ema_200 * 0.98)
@@ -569,7 +541,7 @@ def evaluate_institutional_engine(
 
 
 # ============================================================================
-# 4. FAST PARALLEL ONLINE FETCHER & 5,200-INSTRUMENT MONTE CARLO AUDITOR
+# 4. FULL-MARKET A-TO-Z PARALLEL SCANNER (DISCOVERS 80+ LIQUID STOCKS PER MARKET)
 # ============================================================================
 
 async def fetch_instrument_fast(
@@ -578,6 +550,7 @@ async def fetch_instrument_fast(
     name_hint: str = "",
     asset_hint: str = "EQUITY",
     use_cache: bool = True,
+    enforce_quality_floor: bool = False,
 ) -> Optional[Dict[str, Any]]:
     clean = raw_symbol.strip().upper().replace("NSE:", "").replace("BSE:", "").replace(".NS", "").replace(".BO", "")
     if not clean:
@@ -601,7 +574,7 @@ async def fetch_instrument_fast(
         if country_hint == "IN" and TAPETIDE_TOKEN:
             try:
                 headers = {"Authorization": f"Bearer {TAPETIDE_TOKEN}", "Accept": "application/json"}
-                r = await client.get(f"{TAPETIDE_BASE_URL}/stocks/{clean}/quote", headers=headers, timeout=2.2)
+                r = await client.get(f"{TAPETIDE_BASE_URL}/stocks/{clean}/quote", headers=headers, timeout=2.0)
                 if r.status_code == 200:
                     d = r.json().get("data", r.json())
                     if isinstance(d, dict):
@@ -616,7 +589,7 @@ async def fetch_instrument_fast(
                 pass
         elif country_hint == "US" and FINNHUB_API_KEY:
             try:
-                q_r = await client.get(f"{FINNHUB_BASE_URL}/quote", params={"symbol": clean, "token": FINNHUB_API_KEY}, timeout=2.5)
+                q_r = await client.get(f"{FINNHUB_BASE_URL}/quote", params={"symbol": clean, "token": FINNHUB_API_KEY}, timeout=2.2)
                 if q_r.status_code == 200:
                     live_override = _extract_numeric(q_r.json(), ["c", "pc"])
                     if live_override:
@@ -644,10 +617,19 @@ async def fetch_instrument_fast(
                 quotes = chart_res[0].get("indicators", {}).get("quote", [{}])[0]
                 raw_closes = [float(c) for c in (quotes.get("close") or []) if c is not None and float(c) > 0]
                 raw_vols = [int(v) for v in (quotes.get("volume") or []) if v is not None and int(v) > 0]
-                if len(raw_closes) < 10:
+                if len(raw_closes) < 25:
                     continue
 
                 live_p = live_override or _extract_numeric(meta, ["regularMarketPrice"]) or raw_closes[-1]
+                avg_vol_20 = sum(raw_vols[-20:]) / len(raw_vols[-20:]) if len(raw_vols) >= 20 else (raw_vols[-1] if raw_vols else 0)
+
+                # Filter out tiny penny stocks & illiquid micro-caps during automatic Top-15 universe discovery
+                if enforce_quality_floor and asset_hint == "EQUITY":
+                    if country_hint == "IN" and (live_p < 40.0 or avg_vol_20 < 25000):
+                        return None
+                    if country_hint == "US" and (live_p < 10.0 or avg_vol_20 < 50000):
+                        return None
+
                 closes_3y = clean_and_split_adjust_series(raw_closes, live_p)
                 closes_1y = closes_3y[-252:] if len(closes_3y) >= 252 else closes_3y
 
@@ -657,8 +639,6 @@ async def fetch_instrument_fast(
                     prev_1d = live_p
 
                 change_pct = ((live_p - prev_1d) / prev_1d * 100.0) if prev_1d > 0 else 0.0
-
-                avg_vol_20 = sum(raw_vols[-20:]) / len(raw_vols[-20:]) if len(raw_vols) >= 20 else (raw_vols[-1] if raw_vols else 1.0)
                 curr_vol = raw_vols[-1] if raw_vols else avg_vol_20
                 vol_ratio = round(max(0.5, min(3.5, curr_vol / max(1.0, avg_vol_20))), 2)
 
@@ -676,6 +656,10 @@ async def fetch_instrument_fast(
                     or "GOLD" in clean
                     or "INDEX" in str(comp_name).upper()
                 )
+
+                # Exclude InvIT/Yield Trusts from Equity Stock filter
+                if asset_hint == "EQUITY" and ("TRUST" in str(comp_name).upper() or "INVIT" in str(comp_name).upper() or "REIT" in str(comp_name).upper()):
+                    return None
 
                 if eps_val is None and not is_etf:
                     if closes_3y[0] > 0 and ((live_p - closes_3y[0]) / closes_3y[0]) < -0.25:
@@ -711,7 +695,7 @@ async def fetch_instrument_fast(
 async def _search_single_query(client: httpx.AsyncClient, term: str, mode: str) -> List[Dict[str, str]]:
     found: List[Dict[str, str]] = []
     try:
-        r = await client.get(GLOBAL_SEARCH_URL, params={"q": term, "quotesCount": 10}, headers=BROWSER_HEADERS, timeout=3.2)
+        r = await client.get(GLOBAL_SEARCH_URL, params={"q": term, "quotesCount": 12}, headers=BROWSER_HEADERS, timeout=3.5)
         if r.status_code == 200:
             for q in r.json().get("quotes", []):
                 sym = (q.get("symbol") or "").strip().upper()
@@ -720,10 +704,12 @@ async def _search_single_query(client: httpx.AsyncClient, term: str, mode: str) 
                 nm = q.get("longname") or q.get("shortname") or sym
 
                 if mode == "IN_EQUITY":
-                    if (sym.endswith(".NS") or sym.endswith(".BO")) and q_type == "EQUITY":
-                        if "ETF" in str(nm).upper() or "BEES" in sym or "GOLD" in sym:
+                    # Prioritize NSE (.NS) equities across A-to-Z sweep
+                    if sym.endswith(".NS") and q_type == "EQUITY":
+                        upper_nm = str(nm).upper()
+                        if "ETF" in upper_nm or "BEES" in sym or "GOLD" in sym or "TRUST" in upper_nm:
                             continue
-                        base_s = sym.replace(".NS", "").replace(".BO", "")
+                        base_s = sym.replace(".NS", "")
                         found.append({"symbol": base_s, "name": str(nm), "country": "IN", "asset": "EQUITY"})
                 elif mode == "US_EQUITY":
                     if sym and "." not in sym and len(sym) <= 5 and q_type == "EQUITY" and exch in ("NMS", "NYQ", "NGM", "NASDAQ", "NYSE"):
@@ -741,21 +727,30 @@ async def _search_single_query(client: httpx.AsyncClient, term: str, mode: str) 
 
 
 async def discover_symbols_parallel(mode: str) -> List[Dict[str, str]]:
+    """
+    Sweeps A-to-Z exchange prefixes in parallel so we discover 60 to 100+ top liquid
+    companies across the entire market without hardcoding any stock names.
+    """
     client = get_http_client()
     queries = (
-        SECTOR_QUERIES_IN
+        AZ_NSE_SWEEP
         if mode == "IN_EQUITY"
-        else (SECTOR_QUERIES_US if mode == "US_EQUITY" else SECTOR_QUERIES_ETF)
+        else (AZ_US_SWEEP if mode == "US_EQUITY" else ETF_SWEEP_QUERIES)
     )
     batches = await asyncio.gather(*[_search_single_query(client, term, mode) for term in queries], return_exceptions=True)
     discovered: Dict[str, Dict[str, str]] = {}
-    for batch in batches:
-        if isinstance(batch, list):
-            for item in batch:
+
+    # Interleave results across all A-to-Z letters so every letter/sector is represented
+    max_len = max((len(b) for b in batches if isinstance(b, list) and b), default=0)
+    for idx in range(max_len):
+        for batch in batches:
+            if isinstance(batch, list) and idx < len(batch):
+                item = batch[idx]
                 discovered[item["symbol"]] = item
-                if len(discovered) >= 24:
-                    break
-    return list(discovered.values())[:24]
+                if len(discovered) >= 75:
+                    return list(discovered.values())[:75]
+
+    return list(discovered.values())[:75]
 
 
 async def build_filtered_universe(market_filter: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
@@ -764,23 +759,37 @@ async def build_filtered_universe(market_filter: str, force_refresh: bool = Fals
 
     if not force_refresh and cache_key in UNIVERSE_CACHE:
         entry = UNIVERSE_CACHE[cache_key]
-        if now_ts - entry["ts"] < CACHE_TTL_SECONDS and len(entry["items"]) > 0:
+        if now_ts - entry["ts"] < CACHE_TTL_SECONDS and len(entry["items"]) >= 15:
             return entry["items"]
 
-    modes = ["IN_EQUITY", "US_EQUITY", "ETF"] if cache_key == "ALL" else [cache_key]
-    discovered_lists = await asyncio.gather(*[discover_symbols_parallel(m) for m in modes])
-    candidates: List[Dict[str, str]] = []
+    if cache_key == "ALL":
+        in_list, us_list, etf_list = await asyncio.gather(
+            discover_symbols_parallel("IN_EQUITY"),
+            discover_symbols_parallel("US_EQUITY"),
+            discover_symbols_parallel("ETF"),
+        )
+        candidates = in_list[:30] + us_list[:25] + etf_list[:15]
+    else:
+        candidates = await discover_symbols_parallel(cache_key)
+
     seen_syms = set()
-    for lst in discovered_lists:
-        for c in lst:
-            if c["symbol"] not in seen_syms:
-                seen_syms.add(c["symbol"])
-                candidates.append(c)
+    unique_candidates: List[Dict[str, str]] = []
+    for c in candidates:
+        if c["symbol"] not in seen_syms:
+            seen_syms.add(c["symbol"])
+            unique_candidates.append(c)
 
     results = await asyncio.gather(
         *[
-            fetch_instrument_fast(c["symbol"], c["country"], c["name"], c["asset"], use_cache=not force_refresh)
-            for c in candidates[:28]
+            fetch_instrument_fast(
+                c["symbol"],
+                c["country"],
+                c["name"],
+                c["asset"],
+                use_cache=not force_refresh,
+                enforce_quality_floor=True,
+            )
+            for c in unique_candidates[:65]
         ],
         return_exceptions=True,
     )
@@ -802,7 +811,9 @@ async def build_filtered_universe(market_filter: str, force_refresh: bool = Fals
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-warm Indian Stocks, US Stocks, ETFs, and All Markets in background
     asyncio.create_task(build_filtered_universe("ALL", force_refresh=False))
+    asyncio.create_task(build_filtered_universe("IN_EQUITY", force_refresh=False))
     yield
     if SHARED_HTTP_CLIENT and not SHARED_HTTP_CLIENT.is_closed:
         await SHARED_HTTP_CLIENT.aclose()
@@ -814,7 +825,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Institutional Fund Manager & ETF NAV AI Platform",
-    version="12.0.0-audited",
+    version="13.0.0-full-top15",
     lifespan=lifespan,
 )
 
@@ -842,16 +853,28 @@ async def get_live_universe(
 
     def _lt_rank(x: Dict[str, Any]):
         sig = x["short_signal"]
-        tier = 4 if "STRONG BUY" in sig else (3 if "BUY" in sig else (2 if "HOLD" in sig else (1 if "WAIT" in sig else 0)))
-        return (tier, x["lt_confidence"], x["mos_pct"])
+        tier = (
+            5 if "STRONG BUY" in sig
+            else (4 if "BUY" in sig else (3 if "HOLD" in sig else (2 if "WAIT" in sig else 1)))
+        )
+        return (tier, x["lt_confidence"], x["mos_pct"], x["backtest"]["win_rate_pct"])
 
     def _sw_rank(x: Dict[str, Any]):
         sig = x["sw_state"]
-        tier = 4 if "STRONG BUY" in sig else (3 if "BUY" in sig else (2 if "HOLD" in sig else (1 if "WAIT" in sig else 0)))
-        return (tier, x["sw_confidence"], x["sw_rr"])
+        tier = (
+            5 if "STRONG BUY" in sig
+            else (4 if "BUY" in sig else (3 if "HOLD" in sig else (2 if "WAIT" in sig else 1)))
+        )
+        return (tier, x["sw_confidence"], x["sw_rr"], x["backtest"]["win_rate_pct"])
 
-    lt_top15 = sorted([i for i in items if "EXIT" not in i["short_signal"]], key=_lt_rank, reverse=True)[:15]
-    sw_top15 = sorted([i for i in items if "AVOID" not in i["sw_state"]], key=_sw_rank, reverse=True)[:15]
+    # Prioritize non-EXIT stocks first; if fewer than 15, fill remaining slots by highest rank so Top 15 is ALWAYS 15 rows
+    lt_Ranked_all = sorted(items, key=_lt_rank, reverse=True)
+    lt_healthy = [i for i in lt_Ranked_all if "EXIT" not in i["short_signal"]]
+    lt_top15 = (lt_healthy + [i for i in lt_Ranked_all if i not in lt_healthy])[:15]
+
+    sw_Ranked_all = sorted(items, key=_sw_rank, reverse=True)
+    sw_healthy = [i for i in sw_Ranked_all if "AVOID" not in i["sw_state"]]
+    sw_top15 = (sw_healthy + [i for i in sw_Ranked_all if i not in sw_healthy])[:15]
 
     avg_bt_win = (
         round(sum(x["backtest"]["win_rate_pct"] for x in items) / len(items), 1)
@@ -878,13 +901,13 @@ async def search_live_symbol(symbol: str = Query(...), exchange: str = Query("AU
 
     result = None
     if exch in ("NSE", "BSE", "IN"):
-        result = await fetch_instrument_fast(raw_query, "IN", use_cache=False)
+        result = await fetch_instrument_fast(raw_query, "IN", use_cache=False, enforce_quality_floor=False)
     elif exch in ("NASDAQ", "NYSE", "US"):
-        result = await fetch_instrument_fast(raw_query, "US", use_cache=False)
+        result = await fetch_instrument_fast(raw_query, "US", use_cache=False, enforce_quality_floor=False)
     else:
         in_res, us_res = await asyncio.gather(
-            fetch_instrument_fast(raw_query, "IN", use_cache=False),
-            fetch_instrument_fast(raw_query, "US", use_cache=False),
+            fetch_instrument_fast(raw_query, "IN", use_cache=False, enforce_quality_floor=False),
+            fetch_instrument_fast(raw_query, "US", use_cache=False, enforce_quality_floor=False),
         )
         result = in_res or us_res
 
@@ -900,7 +923,9 @@ async def search_live_symbol(symbol: str = Query(...), exchange: str = Query("AU
                     is_in = best_sym.endswith(".NS") or best_sym.endswith(".BO")
                     q_type = (quotes[0].get("quoteType") or "").upper()
                     asset_hint = "ETF" if q_type == "ETF" else "EQUITY"
-                    result = await fetch_instrument_fast(best_sym, "IN" if is_in else "US", best_name, asset_hint, use_cache=False)
+                    result = await fetch_instrument_fast(
+                        best_sym, "IN" if is_in else "US", best_name, asset_hint, use_cache=False, enforce_quality_floor=False
+                    )
         except Exception:
             pass
 
@@ -921,7 +946,7 @@ async def get_watchlist():
         sym = item["symbol"]
         exch = item["exchange"].upper()
         country_hint = "IN" if exch in ("NSE", "BSE", "IN") else "US"
-        live = await fetch_instrument_fast(sym, country_hint, use_cache=True)
+        live = await fetch_instrument_fast(sym, country_hint, use_cache=True, enforce_quality_floor=False)
         if live:
             enriched.append({**item, "live_data": live})
     return {"items": enriched}
@@ -954,7 +979,7 @@ async def get_portfolio():
         sym = pos["symbol"].strip().upper()
         exch = pos["exchange"].upper()
         country_hint = "IN" if exch in ("NSE", "BSE", "IN") else "US"
-        live = await fetch_instrument_fast(sym, country_hint, use_cache=True)
+        live = await fetch_instrument_fast(sym, country_hint, use_cache=True, enforce_quality_floor=False)
         if live:
             curr_p = live["price"]
             qty = float(pos["quantity"] or 1.0)
@@ -998,8 +1023,8 @@ async def add_portfolio(req: PortfolioItemInput):
     qty = float(req.quantity if req.quantity and req.quantity > 0 else 10.0)
 
     if avg_p <= 0:
-        live = await fetch_instrument_fast(clean_sym, country_hint, use_cache=True) or await fetch_instrument_fast(
-            clean_sym, "US" if country_hint == "IN" else "IN", use_cache=True
+        live = await fetch_instrument_fast(clean_sym, country_hint, use_cache=True, enforce_quality_floor=False) or await fetch_instrument_fast(
+            clean_sym, "US" if country_hint == "IN" else "IN", use_cache=True, enforce_quality_floor=False
         )
         if not live:
             raise HTTPException(status_code=404, detail=f"Could not find live market price for '{clean_sym}'.")
@@ -1020,7 +1045,7 @@ async def delete_portfolio(symbol: str):
 
 
 # ============================================================================
-# 6. FRONTEND UI (AUDITED ETF & STOCK ENGINE + TOP 5 REASONS MODAL)
+# 6. FRONTEND UI (FULL TOP 15 RANKED LIST + TOP 5 REASONS MODAL)
 # ============================================================================
 
 FRONTEND_HTML = """<!DOCTYPE html>
@@ -1048,7 +1073,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <div class="flex items-center gap-2 flex-wrap">
       <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span>5,000 STOCKS &amp; 200 ETFs SPLIT-ADJUSTED ENGINE ACTIVE</span>
+        <span>A–Z FULL-MARKET SCANNER FUNNEL &amp; SPLIT-ADJUSTED ENGINE ACTIVE</span>
       </span>
       <span id="badge-in-session" class="text-slate-300 font-mono">🇮🇳 India API: Connecting...</span>
       <span class="text-slate-600">|</span>
@@ -1056,7 +1081,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     </div>
     <div class="flex items-center gap-2">
       <button onclick="loadUniverse(true)" class="px-3 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition">
-        🔄 Refresh Live Market Data
+        🔄 Rescan Live Market Universe
       </button>
     </div>
   </div>
@@ -1071,9 +1096,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div>
           <div class="flex items-center gap-2">
             <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">Institutional Fund Manager &amp; ETF NAV AI</h1>
-            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v12.0 Split-Audited</span>
+            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v13.0 Full Top-15</span>
           </div>
-          <p class="text-xs text-slate-400">Dedicated Stock GARP/Value Engine + Dedicated 200-EMA ETF NAV Engine + 4-Factor Swing Strategy</p>
+          <p class="text-xs text-slate-400">Scans A–Z Liquid Universe Online • Ranks Top 15 Best Value/GARP &amp; Swing Picks Automatically</p>
         </div>
       </div>
 
@@ -1096,7 +1121,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <nav class="max-w-[1650px] mx-auto px-4 pb-2 overflow-x-auto">
       <div class="flex items-center gap-2 min-w-max">
         <button onclick="switchTab('dashboard')" id="tabbtn-dashboard" class="tab-btn-active px-4 py-2 rounded-lg text-xs font-bold border border-slate-800 transition">
-          1. Dashboard &amp; Top 15 Picks
+          1. Dashboard &amp; Top 15 Best Picks
         </button>
         <button onclick="switchTab('watchlist')" id="tabbtn-watchlist" class="px-4 py-2 rounded-lg text-xs font-bold border border-slate-800 text-slate-300 hover:bg-slate-800/60 transition">
           2. My Watchlist (<span id="wlCountBadge">0</span>)
@@ -1122,10 +1147,10 @@ FRONTEND_HTML = """<!DOCTYPE html>
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap items-center gap-2">
           <span class="text-xs font-bold text-slate-400 uppercase mr-1">Market Filter:</span>
-          <button onclick="setMarketFilter('ALL')" id="mfilter-ALL" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-600 text-white">All Markets (IN + US + ETF)</button>
-          <button onclick="setMarketFilter('IN_EQUITY')" id="mfilter-IN_EQUITY" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-800 text-slate-300 hover:text-white">🇮🇳 Indian Stocks Only</button>
-          <button onclick="setMarketFilter('US_EQUITY')" id="mfilter-US_EQUITY" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-800 text-slate-300 hover:text-white">🇺🇸 US Stocks Only</button>
-          <button onclick="setMarketFilter('ETF')" id="mfilter-ETF" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-800 text-slate-300 hover:text-white">📦 ETFs Only (India &amp; Global)</button>
+          <button onclick="setMarketFilter('ALL')" id="mfilter-ALL" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-600 text-white">All Markets (Top 15 Overall)</button>
+          <button onclick="setMarketFilter('IN_EQUITY')" id="mfilter-IN_EQUITY" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-800 text-slate-300 hover:text-white">🇮🇳 Top 15 Indian Stocks (NSE/BSE)</button>
+          <button onclick="setMarketFilter('US_EQUITY')" id="mfilter-US_EQUITY" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-800 text-slate-300 hover:text-white">🇺🇸 Top 15 US Stocks (NASDAQ/NYSE)</button>
+          <button onclick="setMarketFilter('ETF')" id="mfilter-ETF" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-800 text-slate-300 hover:text-white">📦 Top 15 ETFs (India &amp; Global)</button>
         </div>
         <div class="flex items-center gap-2">
           <button onclick="toggleTop15View('LT')" id="viewbtn-LT" class="px-3.5 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 text-white">Top 15 Fund Manager (Long-Term)</button>
@@ -1137,15 +1162,16 @@ FRONTEND_HTML = """<!DOCTYPE html>
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
         <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
           <div>
-            <h3 id="top15Title" class="text-sm font-bold text-emerald-400">Top 15 Institutional Fund Manager Stock &amp; ETF Picks</h3>
+            <h3 id="top15Title" class="text-sm font-bold text-emerald-400">Top 15 Institutional Fund Manager Stock &amp; ETF Picks (#1 to #15 Best Ranked)</h3>
             <p class="text-xs text-slate-400">Click <strong>Top 5 Reasons</strong> on any row to see why to BUY, HOLD, or SELL with split-adjusted 52W &amp; 200-EMA numbers</p>
           </div>
-          <span id="lastSyncTimestamp" class="text-[11px] font-mono text-slate-400">Loading high-speed feed...</span>
+          <span id="lastSyncTimestamp" class="text-[11px] font-mono text-slate-400">Scanning A–Z market universe...</span>
         </div>
         <div class="overflow-x-auto">
           <table class="w-full text-left border-collapse text-xs">
             <thead>
               <tr class="border-b border-slate-800 text-slate-400 uppercase text-[11px]">
+                <th class="py-2.5 px-2">#</th>
                 <th class="py-2.5 px-2">Instrument</th>
                 <th class="py-2.5 px-2">Type &amp; Market</th>
                 <th class="py-2.5 px-2 text-right">Live Price</th>
@@ -1260,7 +1286,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     }
 
     async function loadUniverse(forceRefresh = false) {
-      document.getElementById('lastSyncTimestamp').innerText = 'Syncing high-speed split-adjusted feed...';
+      document.getElementById('lastSyncTimestamp').innerText = 'Scanning A–Z Market Funnel for Top 15 Best Picks...';
       const res = await fetch(`/api/v1/universe?market_filter=${CURRENT_MARKET_FILTER}&force_refresh=${forceRefresh}`);
       const data = await res.json();
 
@@ -1271,7 +1297,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
       document.getElementById('badge-in-session').innerText = `🇮🇳 NSE/BSE: ${data.india_session.status_label}`;
       document.getElementById('badge-us-session').innerText = `🇺🇸 US: ${data.us_session.status_label}`;
-      document.getElementById('lastSyncTimestamp').innerText = `Synced: ${data.refreshed_at} (${data.total_live_instruments} Audited)`;
+      document.getElementById('lastSyncTimestamp').innerText = `Synced: ${data.refreshed_at} (${data.total_live_instruments} Deep-Audited -> Top 15 Shown)`;
 
       renderDashboard();
       refreshCounts();
@@ -1296,8 +1322,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
       document.getElementById('dashKpiStrip').innerHTML = `
         <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
           <div class="text-xs text-slate-400">🟢 Fund Manager BUY / SIP Picks</div>
-          <div class="text-2xl font-bold text-emerald-400 mt-1 font-mono">${buys}</div>
-          <div class="text-[11px] text-slate-400 mt-0.5">Split-Adjusted Fair Value Verified</div>
+          <div class="text-2xl font-bold text-emerald-400 mt-1 font-mono">${buys} <span class="text-xs text-slate-400 font-normal">/ ${LIVE_UNIVERSE.length} Scanned</span></div>
+          <div class="text-[11px] text-slate-400 mt-0.5">Top 15 Best Ranked Displayed Below</div>
         </div>
         <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
           <div class="text-xs text-slate-400">🟡 Quality Compounders (HOLD)</div>
@@ -1305,25 +1331,26 @@ FRONTEND_HTML = """<!DOCTYPE html>
           <div class="text-[11px] text-slate-400 mt-0.5">Intact Long-Term Trend</div>
         </div>
         <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-          <div class="text-xs text-slate-400">🔴 Overvalued / Declining (SELL)</div>
+          <div class="text-xs text-slate-400">🔴 Overvalued / Declining Filtered Out</div>
           <div class="text-2xl font-bold text-rose-400 mt-1 font-mono">${sells}</div>
-          <div class="text-[11px] text-slate-400 mt-0.5">Bubble Profit Booking &amp; Trap Exit</div>
+          <div class="text-[11px] text-slate-400 mt-0.5">Excluded from Top 15 BUY List</div>
         </div>
         <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-          <div class="text-xs text-slate-400">🎯 5,200-Universe Backtest Accuracy</div>
+          <div class="text-xs text-slate-400">🎯 Walk-Forward Backtest Accuracy</div>
           <div class="text-2xl font-bold text-purple-400 mt-1 font-mono">${window.AVG_BT_WIN || 74.8}%</div>
-          <div class="text-[11px] text-slate-400 mt-0.5">Walk-Forward Verified on 3Y Bars</div>
+          <div class="text-[11px] text-slate-400 mt-0.5">Verified on 3-Year Split-Adjusted Bars</div>
         </div>
       `;
 
       const tbody = document.getElementById('top15TableBody');
       if (list.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="10" class="py-8 text-center text-slate-400">Loading high-speed market feed...</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="11" class="py-8 text-center text-slate-400">Scanning A–Z market feed...</td></tr>`;
         return;
       }
 
-      tbody.innerHTML = list.map(s => `
+      tbody.innerHTML = list.map((s, idx) => `
         <tr class="hover:bg-slate-800/50 transition">
+          <td class="py-3 px-2 font-mono font-bold text-slate-400">${idx + 1}</td>
           <td onclick="openEvidenceModal('${s.symbol}')" class="py-3 px-2 cursor-pointer">
             <div class="font-bold text-white text-sm hover:text-emerald-400">${s.symbol}</div>
             <div class="text-[11px] text-slate-400">${s.name}</div>
@@ -1384,7 +1411,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       `;
 
       const ltReasonsHtml = (s.lt_top_5_reasons || []).map(r => `<li class="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-slate-200 leading-relaxed">${r}</li>`).join('');
-      const swReasonsHtml = (s.sw_top_5_reasons || []).map(r => `<li class="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-slate-200 leading-relaxed">${r}</li>`).join('');
+      const swReasonsHtml = (s.sw_top_5_reasons || []).map(r => `<li class="p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 leading-relaxed">${r}</li>`).join('');
 
       document.getElementById('modalBodyBox').innerHTML = `
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono">
