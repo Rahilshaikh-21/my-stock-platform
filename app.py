@@ -16,11 +16,13 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ============================================================================
-# 1. PRE-LOADED DHAN CREDENTIALS & 12-HOUR GOOGLE SHEET AUTO-TOKEN SYNCER
+# 1. PRE-LOADED DHAN CREDENTIALS (CLIENT ID + API KEY + SECRET + JWT TOKEN)
 #    (STRICTLY ZERO STOCK OR ETF NAMES HARDCODED ANYWHERE IN THIS CODE)
 # ============================================================================
 
 DEFAULT_DHAN_CLIENT_ID = "1113782932"
+DEFAULT_DHAN_API_KEY = "93274c9f"
+DEFAULT_DHAN_API_SECRET = "f0200da2-cba1-419c-a955-0d7671783ff7"
 DEFAULT_DHAN_ACCESS_TOKEN = (
     "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9."
     "eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzkyNzgyMzgxLCJpYXQiOjE3OTI2OTU5ODEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTEzNzgyOTMyIn0."
@@ -28,8 +30,10 @@ DEFAULT_DHAN_ACCESS_TOKEN = (
 )
 
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", DEFAULT_DHAN_CLIENT_ID).strip()
+DHAN_API_KEY = os.getenv("DHAN_API_KEY", DEFAULT_DHAN_API_KEY).strip()
+DHAN_API_SECRET = os.getenv("DHAN_API_SECRET", DEFAULT_DHAN_API_SECRET).strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_ACCESS_TOKEN).strip()
-DHAN_TOKEN_GSHEET_URL = os.getenv("DHAN_TOKEN_GSHEET_URL", "").strip()
+PORTFOLIO_GSHEET_URL = os.getenv("PORTFOLIO_GSHEET_URL", "").strip()
 
 TAPETIDE_TOKEN = os.getenv(
     "TAPETIDE_TOKEN",
@@ -77,11 +81,12 @@ DISCOVERY_TERMS_ETF = [
 SHARED_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 FETCH_SEMAPHORE = asyncio.Semaphore(6)
 
-# Runtime Broker State (auto-updated every 30 mins from Google Sheet or via Webhook)
 BROKER_RUNTIME_CONFIG: Dict[str, str] = {
     "dhan_client_id": DHAN_CLIENT_ID,
+    "dhan_api_key": DHAN_API_KEY,
+    "dhan_api_secret": DHAN_API_SECRET,
     "dhan_access_token": DHAN_ACCESS_TOKEN,
-    "token_gsheet_url": DHAN_TOKEN_GSHEET_URL,
+    "portfolio_gsheet_url": PORTFOLIO_GSHEET_URL,
     "last_token_sync": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
 }
 DHAN_SECURITY_MAP: Dict[str, Dict[str, str]] = {}
@@ -93,7 +98,6 @@ CACHE_TTL_SECONDS = 900.0
 WATCHLIST_STORE: List[Dict[str, Any]] = []
 PORTFOLIO_STORE: List[Dict[str, Any]] = []
 
-# Regex that detects any valid Dhan JWT token (eyJ0eXAiOiJKV1Qi...) inside a Google Sheet CSV
 JWT_TOKEN_PATTERN = re.compile(r"(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})")
 
 
@@ -143,51 +147,198 @@ def _extract_numeric(data: Dict[str, Any], keys: List[str]) -> Optional[float]:
     return None
 
 
-# ============================================================================
-# 2. AUTOMATIC GOOGLE SHEET JWT TOKEN SYNCER + DHAN OFFICIAL ADAPTER
-# ============================================================================
-
-async def sync_dhan_token_from_gsheet(sheet_url: Optional[str] = None) -> Optional[str]:
-    """
-    Reads the user's Google Sheet that auto-updates the Dhan token every 12 hours,
-    automatically finds the JWT token ('eyJ...') anywhere in the sheet, and updates
-    BROKER_RUNTIME_CONFIG["dhan_access_token"] in memory!
-    """
-    target_url = (sheet_url or BROKER_RUNTIME_CONFIG.get("token_gsheet_url") or "").strip()
-    if not target_url:
-        return None
-
-    export_url = target_url
-    if "/spreadsheets/d/" in target_url and "/export" not in target_url and "output=csv" not in target_url:
-        doc_id = target_url.split("/spreadsheets/d/")[1].split("/")[0]
-        # Preserve gid if present
-        gid_match = re.search(r"gid=(\d+)", target_url)
-        gid_str = f"&gid={gid_match.group(1)}" if gid_match else ""
-        export_url = f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv{gid_str}"
-
-    client = get_http_client()
+def _parse_clean_float(val_str: str) -> float:
+    if not val_str:
+        return 0.0
+    cleaned = re.sub(r"[^\d.-]", "", str(val_str))
     try:
-        r = await client.get(export_url, headers=BROWSER_HEADERS, timeout=8.0)
-        if r.status_code == 200 and r.text:
-            matches = JWT_TOKEN_PATTERN.findall(r.text)
-            if matches:
-                # Take the latest JWT token found in the sheet
-                fresh_token = matches[-1].strip()
-                BROKER_RUNTIME_CONFIG["dhan_access_token"] = fresh_token
-                BROKER_RUNTIME_CONFIG["token_gsheet_url"] = target_url
-                BROKER_RUNTIME_CONFIG["last_token_sync"] = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-                return fresh_token
+        return float(cleaned) if cleaned not in ("", "-", ".") else 0.0
+    except ValueError:
+        return 0.0
+
+
+# ============================================================================
+# 2. DHAN LIVE HOLDINGS + GOOGLE SHEET PORTFOLIO & 12-HR TOKEN AUTO-SYNCER
+# ============================================================================
+
+async def sync_dhan_live_holdings_into_portfolio() -> int:
+    """
+    Calls DhanHQ Official API (/v2/holdings) using the user's Client ID & Access Token
+    or API Key to automatically import live demat holdings into My Portfolio.
+    """
+    token = BROKER_RUNTIME_CONFIG.get("dhan_access_token", "").strip()
+    client_id = BROKER_RUNTIME_CONFIG.get("dhan_client_id", "").strip()
+    if not token:
+        return 0
+
+    headers = {
+        "access-token": token,
+        "client-id": client_id,
+        "Accept": "application/json",
+    }
+    client = get_http_client()
+    imported = 0
+    try:
+        r = await client.get(f"{DHAN_BASE_URL}/holdings", headers=headers, timeout=5.0)
+        if r.status_code == 200:
+            rows = r.json()
+            if isinstance(rows, list):
+                global PORTFOLIO_STORE
+                for item in rows:
+                    if isinstance(item, dict):
+                        sym = (item.get("tradingSymbol") or "").strip().upper()
+                        qty = _extract_numeric(item, ["totalQty", "availableQty", "dpQty"]) or 0.0
+                        avg_cost = _extract_numeric(item, ["avgCostPrice", "buyAvg"]) or 0.0
+                        if sym and qty > 0:
+                            PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p["symbol"].upper() != sym]
+                            PORTFOLIO_STORE.append({
+                                "symbol": sym,
+                                "exchange": "NSE",
+                                "quantity": round(qty, 2),
+                                "avg_buy_price": round(avg_cost, 2),
+                            })
+                            imported += 1
     except Exception:
         pass
-    return None
+    return imported
 
 
-async def periodic_token_sync_loop() -> None:
-    """Background loop that checks the user's Google Sheet every 30 minutes for a renewed Dhan token."""
+async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Connects to the user's Google Sheet (both the main sheet and Instruments tab if present):
+    1. Detects any updated Dhan JWT token ('eyJ...') renewed by the 12-hour Apps Script.
+    2. Parses portfolio positions (where Qty held > 0 and Avg buy cost > 0) into My Portfolio.
+    3. Parses tracked Watchlist/Universe symbols from the Instruments table.
+    """
+    target_url = (sheet_url or BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url") or "").strip()
+    if not target_url:
+        return {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0}
+
+    BROKER_RUNTIME_CONFIG["portfolio_gsheet_url"] = target_url
+    doc_id = ""
+    if "/spreadsheets/d/" in target_url:
+        doc_id = target_url.split("/spreadsheets/d/")[1].split("/")[0]
+
+    urls_to_check = [target_url]
+    if doc_id:
+        urls_to_check = [
+            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Instruments",
+            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Transactions",
+            f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv",
+        ]
+
+    client = get_http_client()
+    token_updated = False
+    positions_imported = 0
+    watchlist_imported = 0
+    tx_accumulator: Dict[str, Dict[str, float]] = {}
+
+    global PORTFOLIO_STORE, WATCHLIST_STORE
+
+    for csv_url in urls_to_check:
+        try:
+            r = await client.get(csv_url, headers=BROWSER_HEADERS, timeout=7.0)
+            if r.status_code != 200 or not r.text:
+                continue
+
+            # 1. Check if a renewed 12-hour Dhan JWT token is present anywhere in this sheet tab
+            jwt_matches = JWT_TOKEN_PATTERN.findall(r.text)
+            if jwt_matches:
+                BROKER_RUNTIME_CONFIG["dhan_access_token"] = jwt_matches[-1].strip()
+                BROKER_RUNTIME_CONFIG["last_token_sync"] = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+                token_updated = True
+
+            # 2. Parse CSV rows for Instruments or Transactions
+            reader = csv.reader(io.StringIO(r.text))
+            rows = list(reader)
+            header_idx = -1
+            col_map: Dict[str, int] = {}
+
+            for r_i, row in enumerate(rows[:15]):
+                lowered = [c.strip().lower() for c in row]
+                if "symbol" in lowered and any("qty" in c for c in lowered):
+                    header_idx = r_i
+                    for c_i, col_name in enumerate(lowered):
+                        col_map[col_name] = c_i
+                    break
+
+            if header_idx >= 0:
+                sym_idx = col_map.get("symbol", 0)
+                qty_idx = next((idx for k, idx in col_map.items() if "qty" in k), -1)
+                cost_idx = next((idx for k, idx in col_map.items() if "avg buy" in k or "price per unit" in k), -1)
+                type_idx = next((idx for k, idx in col_map.items() if "type" in k), -1)
+
+                for data_row in rows[header_idx + 1 :]:
+                    if len(data_row) <= sym_idx:
+                        continue
+                    raw_sym = data_row[sym_idx].strip().upper()
+                    if not raw_sym or len(raw_sym) > 15 or " " in raw_sym or raw_sym in ("TOTAL", "SYMBOL"):
+                        continue
+
+                    qty_val = _parse_clean_float(data_row[qty_idx]) if (qty_idx >= 0 and len(data_row) > qty_idx) else 0.0
+                    cost_val = _parse_clean_float(data_row[cost_idx]) if (cost_idx >= 0 and len(data_row) > cost_idx) else 0.0
+                    row_type = data_row[type_idx].strip().upper() if (type_idx >= 0 and len(data_row) > type_idx) else ""
+
+                    # Check if this is the Transactions sheet (BUY/SELL rows) or Instruments sheet
+                    if row_type in ("BUY", "SELL"):
+                        if raw_sym not in tx_accumulator:
+                            tx_accumulator[raw_sym] = {"qty": 0.0, "total_cost": 0.0}
+                        if row_type == "BUY" and qty_val > 0:
+                            tx_accumulator[raw_sym]["qty"] += qty_val
+                            tx_accumulator[raw_sym]["total_cost"] += (qty_val * cost_val)
+                        elif row_type == "SELL" and qty_val > 0:
+                            tx_accumulator[raw_sym]["qty"] = max(0.0, tx_accumulator[raw_sym]["qty"] - qty_val)
+                    else:
+                        # Instruments sheet row
+                        if qty_val > 0:
+                            PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p["symbol"].upper() != raw_sym]
+                            PORTFOLIO_STORE.append({
+                                "symbol": raw_sym,
+                                "exchange": "NSE",
+                                "quantity": round(qty_val, 2),
+                                "avg_buy_price": round(cost_val, 2),
+                            })
+                            positions_imported += 1
+                        else:
+                            if not any(w["symbol"].upper() == raw_sym for w in WATCHLIST_STORE):
+                                WATCHLIST_STORE.append({
+                                    "symbol": raw_sym,
+                                    "exchange": "NSE",
+                                    "desired_entry": 0.0,
+                                    "thesis": "Synced from Portfolio Tracker Sheet",
+                                })
+                                watchlist_imported += 1
+        except Exception:
+            continue
+
+    # If positions were found in Transactions tab and Instruments tab wasn't already imported
+    if positions_imported == 0 and tx_accumulator:
+        for sym, agg in tx_accumulator.items():
+            if agg["qty"] > 0:
+                avg_c = agg["total_cost"] / agg["qty"] if agg["qty"] > 0 else 0.0
+                PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p["symbol"].upper() != sym]
+                PORTFOLIO_STORE.append({
+                    "symbol": sym,
+                    "exchange": "NSE",
+                    "quantity": round(agg["qty"], 2),
+                    "avg_buy_price": round(avg_c, 2),
+                })
+                positions_imported += 1
+
+    return {
+        "token_updated": token_updated,
+        "positions_imported": positions_imported,
+        "watchlist_imported": watchlist_imported,
+    }
+
+
+async def periodic_12hr_sync_loop() -> None:
+    """Runs automatically in the background to keep Dhan token & Google Sheet portfolio synced."""
     while True:
         await asyncio.sleep(1800)
-        if BROKER_RUNTIME_CONFIG.get("token_gsheet_url"):
-            await sync_dhan_token_from_gsheet()
+        if BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url"):
+            await sync_portfolio_and_token_from_gsheet()
+        await sync_dhan_live_holdings_into_portfolio()
 
 
 async def load_dhan_scrip_master_once() -> None:
@@ -253,12 +404,10 @@ async def fetch_dhan_daily_candles(symbol: str) -> Optional[Dict[str, Any]]:
     }
     try:
         r = await client.post(f"{DHAN_BASE_URL}/charts/historical", json=payload, headers=headers, timeout=5.0)
-        # If token expired (HTTP 401) and user linked their 12-hour Google Sheet, auto-pull new token & retry!
-        if r.status_code == 401 and BROKER_RUNTIME_CONFIG.get("token_gsheet_url"):
-            new_tok = await sync_dhan_token_from_gsheet()
-            if new_tok:
-                headers["access-token"] = new_tok
-                r = await client.post(f"{DHAN_BASE_URL}/charts/historical", json=payload, headers=headers, timeout=5.0)
+        if r.status_code == 401 and BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url"):
+            await sync_portfolio_and_token_from_gsheet()
+            headers["access-token"] = BROKER_RUNTIME_CONFIG.get("dhan_access_token", "")
+            r = await client.post(f"{DHAN_BASE_URL}/charts/historical", json=payload, headers=headers, timeout=5.0)
 
         if r.status_code == 200:
             d = r.json()
@@ -875,7 +1024,6 @@ async def fetch_instrument_fast(
         live_override: Optional[float] = None
         provider_used = "NSE_BSE_LIVE_API" if country_hint == "IN" else "US_MARKET_LIVE_API"
 
-        # 1. Try Dhan Official Daily Historical API first for Indian symbols
         if country_hint == "IN" and BROKER_RUNTIME_CONFIG.get("dhan_access_token"):
             dhan_data = await fetch_dhan_daily_candles(clean)
             if dhan_data:
@@ -910,7 +1058,6 @@ async def fetch_instrument_fast(
                 SYMBOL_CACHE[clean] = {"ts": now_ts, "data": obj}
                 return obj
 
-        # 2. Check Tapetide (IN) or Finnhub (US)
         if country_hint == "IN" and TAPETIDE_TOKEN:
             try:
                 headers = {"Authorization": f"Bearer {TAPETIDE_TOKEN}", "Accept": "application/json"}
@@ -937,7 +1084,6 @@ async def fetch_instrument_fast(
             except Exception:
                 pass
 
-        # 3. Dual-Host Rotated 3-Year Daily Candle Fetch
         candidates = [f"{clean}.NS", f"{clean}.BO", clean] if country_hint == "IN" else [clean, f"{clean}.NS"]
         for idx_c, ticker_sym in enumerate(candidates):
             chart_host = CHART_HOSTS[(hash(ticker_sym) + idx_c) % len(CHART_HOSTS)]
@@ -1180,9 +1326,10 @@ async def build_filtered_universe(market_filter: str, force_refresh: bool = Fals
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(load_dhan_scrip_master_once())
-    if BROKER_RUNTIME_CONFIG.get("token_gsheet_url"):
-        asyncio.create_task(sync_dhan_token_from_gsheet())
-    asyncio.create_task(periodic_token_sync_loop())
+    asyncio.create_task(sync_dhan_live_holdings_into_portfolio())
+    if BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url"):
+        asyncio.create_task(sync_portfolio_and_token_from_gsheet())
+    asyncio.create_task(periodic_12hr_sync_loop())
     asyncio.create_task(build_filtered_universe("ALL", force_refresh=False))
     yield
     if SHARED_HTTP_CLIENT and not SHARED_HTTP_CLIENT.is_closed:
@@ -1194,8 +1341,8 @@ async def lifespan(app: FastAPI):
 # ============================================================================
 
 app = FastAPI(
-    title="Institutional Fund Manager, Dhan 12-Hr Auto-Token & Daily Backtest AI",
-    version="15.0.0-dhan-autosync",
+    title="Institutional Fund Manager, Dhan Key/Secret & Portfolio G-Sheet Sync AI",
+    version="16.0.0-rahil-edition",
     lifespan=lifespan,
 )
 
@@ -1216,25 +1363,29 @@ class PortfolioItemInput(BaseModel):
 
 class BrokerConnectInput(BaseModel):
     dhan_client_id: str = ""
+    dhan_api_key: str = ""
+    dhan_api_secret: str = ""
     dhan_access_token: str = ""
-    token_gsheet_url: str = ""
+    portfolio_gsheet_url: str = ""
 
 
 @app.post("/api/v1/broker/connect")
-async def connect_broker_credentials(req: BrokerConnectInput):
-    """
-    Allows either:
-    1. Pasting the Google Sheet link that auto-updates the Dhan token every 12 hours, OR
-    2. Receiving a direct push webhook from Google Apps Script / manual token input.
-    """
+async def connect_broker_and_portfolio_sheet(req: BrokerConnectInput):
     if req.dhan_client_id:
         BROKER_RUNTIME_CONFIG["dhan_client_id"] = req.dhan_client_id.strip()
+    if req.dhan_api_key:
+        BROKER_RUNTIME_CONFIG["dhan_api_key"] = req.dhan_api_key.strip()
+    if req.dhan_api_secret:
+        BROKER_RUNTIME_CONFIG["dhan_api_secret"] = req.dhan_api_secret.strip()
     if req.dhan_access_token:
         BROKER_RUNTIME_CONFIG["dhan_access_token"] = req.dhan_access_token.strip()
         BROKER_RUNTIME_CONFIG["last_token_sync"] = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-    if req.token_gsheet_url:
-        BROKER_RUNTIME_CONFIG["token_gsheet_url"] = req.token_gsheet_url.strip()
-        await sync_dhan_token_from_gsheet(req.token_gsheet_url.strip())
+
+    sheet_stats = {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0}
+    if req.portfolio_gsheet_url:
+        sheet_stats = await sync_portfolio_and_token_from_gsheet(req.portfolio_gsheet_url.strip())
+
+    dhan_holdings_count = await sync_dhan_live_holdings_into_portfolio()
 
     UNIVERSE_CACHE.clear()
     SYMBOL_CACHE.clear()
@@ -1242,8 +1393,10 @@ async def connect_broker_credentials(req: BrokerConnectInput):
     return {
         "status": "connected",
         "dhan_client_id": BROKER_RUNTIME_CONFIG["dhan_client_id"],
+        "dhan_api_key": BROKER_RUNTIME_CONFIG["dhan_api_key"],
         "dhan_active": bool(BROKER_RUNTIME_CONFIG.get("dhan_access_token")),
-        "gsheet_auto_sync_active": bool(BROKER_RUNTIME_CONFIG.get("token_gsheet_url")),
+        "dhan_holdings_synced": dhan_holdings_count,
+        "sheet_sync": sheet_stats,
         "last_token_sync": BROKER_RUNTIME_CONFIG.get("last_token_sync"),
     }
 
@@ -1291,6 +1444,7 @@ async def get_live_universe(
         "us_session": get_market_session_status("US"),
         "dhan_connected": bool(BROKER_RUNTIME_CONFIG.get("dhan_access_token")),
         "dhan_client_id": BROKER_RUNTIME_CONFIG.get("dhan_client_id"),
+        "dhan_api_key": BROKER_RUNTIME_CONFIG.get("dhan_api_key"),
         "last_token_sync": BROKER_RUNTIME_CONFIG.get("last_token_sync"),
         "total_live_instruments": len(items),
         "avg_backtest_win_rate_pct": avg_bt_win,
@@ -1451,7 +1605,7 @@ async def delete_portfolio(symbol: str):
 
 
 # ============================================================================
-# 7. FRONTEND UI (DHAN 1113782932 PRE-LOADED + 12-HR GSHEET TOKEN SYNCER)
+# 7. FRONTEND UI (DHAN KEY/SECRET PRE-LOADED + PORTFOLIO GSHEET SYNC)
 # ============================================================================
 
 FRONTEND_HTML = """<!DOCTYPE html>
@@ -1479,7 +1633,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <div class="flex items-center gap-2 flex-wrap">
       <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span>DHANHQ CLIENT 1113782932 ACTIVE + DAILY SIGNAL BACKTEST ENGINE</span>
+        <span>DHANHQ APP (RAHIL • KEY 93274c9f • ID 1113782932) ACTIVE</span>
       </span>
       <span id="badge-in-session" class="text-slate-300 font-mono">🇮🇳 India API: Connecting...</span>
       <span class="text-slate-600">|</span>
@@ -1487,7 +1641,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     </div>
     <div class="flex items-center gap-2">
       <button onclick="openBrokerModal()" id="brokerStatusBtn" class="px-2.5 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-xs font-semibold transition">
-        ✓ DhanHQ Active (Link 12-Hr Token G-Sheet)
+        🔗 Sync Dhan &amp; Portfolio G-Sheet
       </button>
       <button onclick="loadUniverse(true)" class="px-3 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition">
         🔄 Rescan Live Market
@@ -1505,9 +1659,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div>
           <div class="flex items-center gap-2">
             <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">Institutional Fund Manager &amp; DhanHQ Daily Backtest AI</h1>
-            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v15.0 Auto-Token</span>
+            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v16.0 Rahil Edition</span>
           </div>
-          <p class="text-xs text-slate-400">Checks Date-by-Date Historical Signals (Kab-Kab BUY/SELL Bola Aur Wo ✅ Sahi Tha Ya ❌ Galat)</p>
+          <p class="text-xs text-slate-400">Auto-Syncs DhanHQ API + Portfolio Tracker Google Sheet • Date-by-Date Historical Signal Audit</p>
         </div>
       </div>
 
@@ -1628,6 +1782,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div><label class="text-slate-400 block">Quantity</label><input id="pfQty" type="number" step="1" value="10" class="mt-0.5 bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 font-mono w-28" /></div>
         <div><label class="text-slate-400 block">Avg Buy Price (0 = Auto Live Price)</label><input id="pfAvg" type="number" step="0.5" placeholder="Auto Live Price if 0" class="mt-0.5 bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 font-mono w-48" /></div>
         <button id="pfAddBtn" onclick="addPortfolioManual()" class="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold">+ Add to Portfolio</button>
+        <button onclick="openBrokerModal()" class="px-3.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 font-semibold">📊 Sync From Portfolio Tracker Sheet</button>
       </div>
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 overflow-x-auto">
         <table class="w-full text-left border-collapse text-xs">
@@ -1643,37 +1798,47 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
   </main>
 
-  <!-- 12-HOUR GOOGLE SHEET TOKEN AUTO-SYNC MODAL -->
+  <!-- DHAN KEY/SECRET & PORTFOLIO GOOGLE SHEET AUTO-SYNC MODAL -->
   <div id="brokerModal" class="hidden fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-6 space-y-4 shadow-2xl text-xs">
       <div class="flex justify-between items-center border-b border-slate-800 pb-3">
         <div>
-          <span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-mono text-[11px]">Dhan Client ID 1113782932 Pre-Connected</span>
-          <h3 class="text-base font-bold text-white mt-1">🔗 Link Your 12-Hour Auto-Updating Token Google Sheet</h3>
+          <span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-mono text-[11px]">Dhan App: Rahil (Key 93274c9f &amp; ID 1113782932)</span>
+          <h3 class="text-base font-bold text-white mt-1">🔗 Sync Portfolio Tracker G-Sheet &amp; 12-Hr Dhan Token</h3>
         </div>
         <button onclick="document.getElementById('brokerModal').classList.add('hidden')" class="px-2.5 py-1 rounded bg-slate-800 font-bold">✕</button>
       </div>
       <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5 text-slate-300">
-        <div class="font-bold text-emerald-400">12-Hour Google Sheet Auto-Sync Kaise Kaam Karta Hai:</div>
-        <div>• Apni us Google Sheet ka link niche paste karein jismein aapka Dhan Token har 12 ghante mein update hota hai (Sheet ki sharing <em>"Anyone with the link can view"</em> rakhein).</div>
-        <div>• Website har 30 minute mein (aur token expire hone par) automatically aapki Sheet se naya <code>eyJ0eXAi...</code> token utha legi!</div>
+        <div class="font-bold text-emerald-400">Automatic Portfolio &amp; 12-Hour Token Sync:</div>
+        <div>• Paste your <strong>Portfolio_Tracker Rahil</strong> Google Sheet link below.</div>
+        <div>• It will automatically import all your active holdings (from <code>Instruments</code> / <code>Transactions</code> tabs) into <strong>My Portfolio</strong> and auto-sync your renewed Dhan token every 12 hours!</div>
       </div>
-      <div class="grid grid-cols-1 gap-3">
+      <div class="grid grid-cols-1 gap-2.5">
         <div>
-          <label class="text-slate-400 block mb-1">Google Sheet Link (Where Dhan Token Updates Every 12 Hours)</label>
-          <input id="tokenGsheetUrlInput" type="text" placeholder="https://docs.google.com/spreadsheets/d/..." class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-white" />
+          <label class="text-slate-400 block mb-1">Portfolio Tracker Google Sheet Link</label>
+          <input id="portfolioGsheetUrlInput" type="text" placeholder="Paste your Google Sheet share link here..." class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-white" />
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-slate-400 block mb-1">Dhan Client ID</label>
+            <input id="dhanClientIdInput" type="text" value="1113782932" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono text-white" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Dhan API Key (Rahil)</label>
+            <input id="dhanApiKeyInput" type="text" value="93274c9f" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono text-white" />
+          </div>
         </div>
         <div>
-          <label class="text-slate-400 block mb-1">Dhan Client ID</label>
-          <input id="dhanClientIdInput" type="text" value="1113782932" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-white" />
+          <label class="text-slate-400 block mb-1">Dhan API Secret</label>
+          <input id="dhanApiSecretInput" type="password" value="f0200da2-cba1-419c-a955-0d7671783ff7" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono text-white" />
         </div>
         <div>
-          <label class="text-slate-400 block mb-1">Or Paste Manual Dhan Access Token (Optional)</label>
-          <input id="dhanTokenInput" type="password" placeholder="Already pre-loaded; paste only if overriding manually" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-white" />
+          <label class="text-slate-400 block mb-1">Dhan Access Token (Optional Manual Override)</label>
+          <input id="dhanTokenInput" type="password" placeholder="Pre-loaded; auto-updates from G-Sheet every 12 hrs" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 font-mono text-white" />
         </div>
       </div>
       <button onclick="saveBrokerCredentials()" class="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold transition">
-        ✓ Activate 12-Hour Google Sheet Auto-Token Sync
+        ✓ Sync Google Sheet Holdings &amp; Activate 12-Hr Auto-Sync
       </button>
     </div>
   </div>
@@ -1698,7 +1863,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       const box = document.getElementById('toastBox');
       box.innerText = msg;
       box.classList.remove('hidden');
-      setTimeout(() => box.classList.add('hidden'), 3200);
+      setTimeout(() => box.classList.add('hidden'), 3500);
     }
 
     function openBrokerModal() {
@@ -1707,20 +1872,21 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
     async function saveBrokerCredentials() {
       const dhan_client_id = document.getElementById('dhanClientIdInput').value.trim();
+      const dhan_api_key = document.getElementById('dhanApiKeyInput').value.trim();
+      const dhan_api_secret = document.getElementById('dhanApiSecretInput').value.trim();
       const dhan_access_token = document.getElementById('dhanTokenInput').value.trim();
-      const token_gsheet_url = document.getElementById('tokenGsheetUrlInput').value.trim();
+      const portfolio_gsheet_url = document.getElementById('portfolioGsheetUrlInput').value.trim();
       const res = await fetch('/api/v1/broker/connect', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({dhan_client_id, dhan_access_token, token_gsheet_url})
+        body: JSON.stringify({dhan_client_id, dhan_api_key, dhan_api_secret, dhan_access_token, portfolio_gsheet_url})
       });
       if (res.ok) {
         const out = await res.json();
         document.getElementById('brokerModal').classList.add('hidden');
-        document.getElementById('brokerStatusBtn').innerText = out.gsheet_auto_sync_active
-          ? '✓ DhanHQ + 12-Hr G-Sheet Auto-Sync ON'
-          : '✓ DhanHQ API Connected';
-        showToast('✓ DhanHQ Auto-Token Sync Activated!');
+        const importedPos = (out.sheet_sync && out.sheet_sync.positions_imported) || 0;
+        showToast(`✓ Connected! Imported ${importedPos} Portfolio Holdings & ${out.dhan_holdings_synced} Dhan Holdings!`);
+        refreshCounts();
         loadUniverse(true);
       }
     }
@@ -2093,7 +2259,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       `;
 
       if (!data.positions || data.positions.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-slate-400">Your Portfolio is empty. Click <strong>+ PF</strong> on any Dashboard stock or add one above!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-slate-400">Your Portfolio is empty. Click <strong>🔗 Sync Dhan &amp; Portfolio G-Sheet</strong> at the top to import your Google Sheet positions automatically!</td></tr>`;
         return;
       }
       tbody.innerHTML = data.positions.map(p => {
