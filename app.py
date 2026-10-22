@@ -379,41 +379,56 @@ async def sync_dhan_live_holdings_into_portfolio() -> int:
 
 
 async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) -> Dict[str, Any]:
+    """Import holdings from Instruments first; only use Transactions as fallback.
+
+    This avoids treating each BUY/SELL transaction as a current position and
+    avoids overwriting the Instruments weighted-average cost with a transaction price.
+    """
     target_url = (sheet_url or BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url") or DEFAULT_PORTFOLIO_GSHEET_URL).strip()
     if not target_url:
-        return {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0}
+        return {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0, "source": "none"}
 
     BROKER_RUNTIME_CONFIG["portfolio_gsheet_url"] = target_url
-    doc_id = ""
-    if "/spreadsheets/d/" in target_url:
-        doc_id = target_url.split("/spreadsheets/d/")[1].split("/")[0]
-
-    urls_to_check = [target_url]
-    if doc_id:
-        urls_to_check = [
-            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Instruments",
-            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Transactions",
-            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Dashboard",
-            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Token",
-            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Config",
-            f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv",
+    match = re.search(r"/spreadsheets/d/([^/]+)", target_url)
+    doc_id = match.group(1) if match else ""
+    if not doc_id:
+        urls = [("unknown", target_url)]
+    else:
+        urls = [
+            ("Instruments", f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Instruments"),
+            ("Transactions", f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Transactions"),
+            ("Token", f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Token"),
+            ("Config", f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Config"),
         ]
 
     client = get_http_client()
     token_updated = False
-    positions_imported = 0
     watchlist_imported = 0
-    tx_accumulator: Dict[str, Dict[str, float]] = {}
-
     global PORTFOLIO_STORE, WATCHLIST_STORE
 
-    for csv_url in urls_to_check:
-        try:
-            r = await client.get(csv_url, headers=BROWSER_HEADERS, timeout=7.0)
-            if r.status_code != 200 or not r.text or "<!DOCTYPE html>" in r.text[:200]:
-                continue
+    def norm(cell: str) -> str:
+        return re.sub(r"\s+", " ", (cell or "").strip().lower())
 
-            jwt_matches = JWT_TOKEN_PATTERN.findall(r.text)
+    def header_index(rows):
+        for ri, row in enumerate(rows[:20]):
+            heads = [norm(c) for c in row]
+            sym_i = next((i for i, h in enumerate(heads) if h == "symbol"), -1)
+            qty_i = next((i for i, h in enumerate(heads) if h in ("qty held", "quantity held", "qty", "quantity")), -1)
+            if sym_i >= 0 and qty_i >= 0:
+                return ri, heads, sym_i, qty_i
+        return -1, [], -1, -1
+
+    # Instruments is the authoritative holdings table. Do not parse Transactions
+    # as positions if this table has valid holdings.
+    instruments_imported = 0
+    transactions_text = None
+    for sheet_name, csv_url in urls:
+        try:
+            resp = await client.get(csv_url, headers=BROWSER_HEADERS, timeout=10.0)
+            if resp.status_code != 200 or not resp.text or "<!DOCTYPE html>" in resp.text[:300]:
+                continue
+            text_body = resp.text
+            jwt_matches = JWT_TOKEN_PATTERN.findall(text_body)
             if jwt_matches:
                 latest_jwt = jwt_matches[-1].strip()
                 if latest_jwt != BROKER_RUNTIME_CONFIG.get("dhan_access_token"):
@@ -421,91 +436,93 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
                 BROKER_RUNTIME_CONFIG["dhan_access_token"] = latest_jwt
                 BROKER_RUNTIME_CONFIG["last_token_sync"] = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
 
-            reader = csv.reader(io.StringIO(r.text))
-            rows = list(reader)
-            header_idx = -1
-            sym_idx = -1
-            qty_idx = -1
-            cost_idx = -1
-            type_idx = -1
+            if sheet_name == "Transactions":
+                transactions_text = text_body
+                continue
+            if sheet_name != "Instruments":
+                continue
 
-            for r_i, row in enumerate(rows[:15]):
-                lowered = [re.sub(r"\s+", " ", c.strip().lower()) for c in row]
-                has_sym = any(c == "symbol" or c.endswith(" symbol") for c in lowered)
-                has_qty = any("qty" in c for c in lowered)
-                if has_sym and has_qty:
-                    header_idx = r_i
-                    for c_i, col_text in enumerate(lowered):
-                        if sym_idx == -1 and (col_text == "symbol" or col_text.endswith(" symbol")):
-                            sym_idx = c_i
-                        if qty_idx == -1 and ("qty held" in col_text or col_text == "qty" or col_text.endswith(" qty")):
-                            qty_idx = c_i
-                        if cost_idx == -1 and ("avg buy cost" in col_text or "price per unit" in col_text):
-                            cost_idx = c_i
-                        if type_idx == -1 and ("type" in col_text):
-                            type_idx = c_i
-                    break
-
-            if header_idx >= 0 and sym_idx >= 0 and qty_idx >= 0:
-                for data_row in rows[header_idx + 1 :]:
-                    if len(data_row) <= max(sym_idx, qty_idx):
-                        continue
-                    raw_sym = data_row[sym_idx].strip().upper().replace("NSE:", "").replace("BSE:", "")
-                    if not raw_sym or len(raw_sym) > 15 or " " in raw_sym or raw_sym in ("TOTAL", "SYMBOL", "-"):
-                        continue
-
-                    qty_val = _parse_clean_float(data_row[qty_idx])
-                    cost_val = _parse_clean_float(data_row[cost_idx]) if (cost_idx >= 0 and len(data_row) > cost_idx) else 0.0
-                    row_type = data_row[type_idx].strip().upper() if (type_idx >= 0 and len(data_row) > type_idx) else ""
-
-                    if row_type in ("BUY", "SELL"):
-                        if raw_sym not in tx_accumulator:
-                            tx_accumulator[raw_sym] = {"qty": 0.0, "total_cost": 0.0}
-                        if row_type == "BUY" and qty_val > 0:
-                            tx_accumulator[raw_sym]["qty"] += qty_val
-                            tx_accumulator[raw_sym]["total_cost"] += (qty_val * cost_val)
-                        elif row_type == "SELL" and qty_val > 0:
-                            tx_accumulator[raw_sym]["qty"] = max(0.0, tx_accumulator[raw_sym]["qty"] - qty_val)
-                    else:
-                        if qty_val > 0:
-                            PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p["symbol"].upper() != raw_sym]
-                            PORTFOLIO_STORE.append({
-                                "symbol": raw_sym,
-                                "exchange": "NSE",
-                                "quantity": round(qty_val, 2),
-                                "avg_buy_price": round(cost_val, 2),
-                            })
-                            positions_imported += 1
-                        else:
-                            if not any(w["symbol"].upper() == raw_sym for w in WATCHLIST_STORE):
-                                WATCHLIST_STORE.append({
-                                    "symbol": raw_sym,
-                                    "exchange": "NSE",
-                                    "desired_entry": 0.0,
-                                    "thesis": "Synced from Portfolio Tracker Sheet",
-                                })
-                                watchlist_imported += 1
+            rows = list(csv.reader(io.StringIO(text_body)))
+            hi, heads, sym_i, qty_i = header_index(rows)
+            if hi < 0:
+                continue
+            cost_i = next((i for i, h in enumerate(heads) if "avg buy cost" in h or h in ("avg buy price", "average buy price", "avg cost")), -1)
+            company_i = next((i for i, h in enumerate(heads) if h in ("company (for stocks)", "company", "name")), -1)
+            parsed = []
+            for row in rows[hi + 1:]:
+                if len(row) <= max(sym_i, qty_i):
+                    continue
+                sym = row[sym_i].strip().upper().replace("NSE:", "").replace("BSE:", "")
+                if not sym or sym in {"TOTAL", "SYMBOL", "-"} or " " in sym or len(sym) > 20:
+                    continue
+                qty = _parse_clean_float(row[qty_i])
+                cost = _parse_clean_float(row[cost_i]) if cost_i >= 0 and len(row) > cost_i else 0.0
+                if qty > 0:
+                    parsed.append({"symbol": sym, "exchange": "NSE", "quantity": round(qty, 4), "avg_buy_price": round(cost, 4) if cost > 0 else 0.0})
+                elif company_i >= 0 and not any(w["symbol"].upper() == sym for w in WATCHLIST_STORE):
+                    WATCHLIST_STORE.append({"symbol": sym, "exchange": "NSE", "desired_entry": 0.0, "thesis": "Synced from Portfolio Tracker Sheet"})
+                    watchlist_imported += 1
+            if parsed:
+                # Replace sheet-owned positions as a batch, preserve unrelated manual/Dhan holdings.
+                parsed_symbols = {p["symbol"] for p in parsed}
+                PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p.get("symbol", "").upper() not in parsed_symbols]
+                PORTFOLIO_STORE.extend(parsed)
+                instruments_imported = len(parsed)
+                break
         except Exception:
             continue
 
-    if positions_imported == 0 and tx_accumulator:
-        for sym, agg in tx_accumulator.items():
-            if agg["qty"] > 0:
-                avg_c = agg["total_cost"] / agg["qty"] if agg["qty"] > 0 else 0.0
-                PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p["symbol"].upper() != sym]
-                PORTFOLIO_STORE.append({
-                    "symbol": sym,
-                    "exchange": "NSE",
-                    "quantity": round(agg["qty"], 2),
-                    "avg_buy_price": round(avg_c, 2),
-                })
-                positions_imported += 1
+    # If Instruments cannot be read, reconstruct current quantity and weighted
+    # average cost from BUY/SELL transaction rows. SELL reduces quantity but
+    # does not alter remaining units' average cost (average-cost accounting).
+    if instruments_imported == 0 and transactions_text:
+        try:
+            rows = list(csv.reader(io.StringIO(transactions_text)))
+            tx_header = -1
+            heads = []
+            for ri, row in enumerate(rows[:20]):
+                candidate = [norm(c) for c in row]
+                if "symbol" in candidate and any(h in ("type (buy/sell)", "type", "buy/sell") for h in candidate) and any(h in ("qty", "quantity") for h in candidate):
+                    tx_header, heads = ri, candidate
+                    break
+            if tx_header >= 0:
+                sym_i = heads.index("symbol")
+                type_i = next(i for i,h in enumerate(heads) if h in ("type (buy/sell)", "type", "buy/sell"))
+                qty_i = next(i for i,h in enumerate(heads) if h in ("qty", "quantity"))
+                price_i = next((i for i,h in enumerate(heads) if "price per unit" in h or h in ("price", "unit price")), -1)
+                acc = {}
+                for row in rows[tx_header+1:]:
+                    if len(row) <= max(sym_i, type_i, qty_i):
+                        continue
+                    sym = row[sym_i].strip().upper().replace("NSE:", "").replace("BSE:", "")
+                    typ = row[type_i].strip().upper()
+                    qty = _parse_clean_float(row[qty_i])
+                    price = _parse_clean_float(row[price_i]) if price_i >= 0 and len(row) > price_i else 0.0
+                    if not sym or typ not in ("BUY", "SELL") or qty <= 0:
+                        continue
+                    a = acc.setdefault(sym, {"qty": 0.0, "cost": 0.0})
+                    if typ == "BUY":
+                        a["cost"] += qty * price
+                        a["qty"] += qty
+                    else:
+                        avg = a["cost"] / a["qty"] if a["qty"] > 0 else 0.0
+                        sold = min(qty, a["qty"])
+                        a["qty"] -= sold
+                        a["cost"] = max(0.0, a["cost"] - sold * avg)
+                parsed = []
+                for sym, a in acc.items():
+                    if a["qty"] > 0:
+                        avg = a["cost"] / a["qty"] if a["qty"] > 0 else 0.0
+                        parsed.append({"symbol": sym, "exchange": "NSE", "quantity": round(a["qty"], 4), "avg_buy_price": round(avg, 4) if avg > 0 else 0.0})
+                if parsed:
+                    syms = {p["symbol"] for p in parsed}
+                    PORTFOLIO_STORE = [p for p in PORTFOLIO_STORE if p.get("symbol", "").upper() not in syms]
+                    PORTFOLIO_STORE.extend(parsed)
+                    instruments_imported = len(parsed)
+        except Exception:
+            pass
 
-    return {
-        "token_updated": token_updated,
-        "positions_imported": positions_imported,
-        "watchlist_imported": watchlist_imported,
-    }
+    return {"token_updated": token_updated, "positions_imported": instruments_imported, "watchlist_imported": watchlist_imported, "source": "Instruments" if instruments_imported else ("Transactions" if transactions_text else "none")}
 
 
 async def periodic_12hr_sync_loop() -> None:
@@ -1817,6 +1834,8 @@ async def get_portfolio():
     enriched = []
     tot_inv_inr = 0.0
     tot_cur_inr = 0.0
+    known_pnl_inr = 0.0
+    missing_cost_positions = 0
     usd_to_inr = 84.10
 
     for pos in PORTFOLIO_STORE:
@@ -1839,6 +1858,9 @@ async def get_portfolio():
             fx = 1.0 if live["country"] == "IN" else usd_to_inr
             if has_cost_basis:
                 tot_inv_inr += inv * fx
+                known_pnl_inr += pnl * fx
+            else:
+                missing_cost_positions += 1
             tot_cur_inr += cur_val * fx
             enriched.append({
                 "symbol": live["symbol"],
@@ -1857,7 +1879,9 @@ async def get_portfolio():
         "summary_inr": {
             "total_invested_inr": round(tot_inv_inr, 2),
             "total_current_inr": round(tot_cur_inr, 2),
-            "total_pnl_inr": round(tot_cur_inr - tot_inv_inr, 2),
+            "total_pnl_inr": round(known_pnl_inr, 2) if missing_cost_positions == 0 else None,
+            "cost_basis_complete": missing_cost_positions == 0,
+            "missing_cost_positions": missing_cost_positions,
         },
     }
 
@@ -2580,8 +2604,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
         </div>
         <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
           <div class="text-xs text-slate-400">Total Unrealized P&amp;L</div>
-          <div class="text-2xl font-bold ${sum.total_pnl_inr >= 0 ? 'text-emerald-400' : 'text-rose-400'} mt-1 font-mono">
-            ${sum.total_pnl_inr >= 0 ? '+' : ''}₹${sum.total_pnl_inr.toLocaleString()}
+          <div class="text-2xl font-bold ${sum.total_pnl_inr == null ? 'text-amber-300' : (sum.total_pnl_inr >= 0 ? 'text-emerald-400' : 'text-rose-400')} mt-1 font-mono">
+            ${sum.total_pnl_inr == null ? 'N/A — missing cost' : `${sum.total_pnl_inr >= 0 ? '+' : ''}₹${sum.total_pnl_inr.toLocaleString()}`}
           </div>
         </div>
       `;
