@@ -21,14 +21,10 @@ from pydantic import BaseModel
 #    (STRICTLY ZERO STOCK OR ETF NAMES HARDCODED ANYWHERE IN THIS CODE)
 # ============================================================================
 
-DEFAULT_DHAN_CLIENT_ID = "1113782932"
-DEFAULT_DHAN_API_KEY = "93274c9f"
-DEFAULT_DHAN_API_SECRET = "f0200da2-cba1-419c-a955-0d7671783ff7"
-DEFAULT_DHAN_ACCESS_TOKEN = (
-    "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9."
-    "eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzkyNzgyMzgxLCJpYXQiOjE3OTI2OTU5ODEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTEzNzgyOTMyIn0."
-    "7JYHzR52yWTDdsjockRnclsBdR0DUhdtNi72qEL7-S7mBNG92TrgKFTXfw5zWuVN5w8Xv9-6dnYeBTKi0H7x3A"
-)
+DEFAULT_DHAN_CLIENT_ID = ""  # Set DHAN_CLIENT_ID in the environment
+DEFAULT_DHAN_API_KEY = ""  # Set DHAN_API_KEY in the environment
+DEFAULT_DHAN_API_SECRET = ""  # Set DHAN_API_SECRET in the environment
+DEFAULT_DHAN_ACCESS_TOKEN = ""  # Set DHAN_ACCESS_TOKEN in the environment
 DEFAULT_PORTFOLIO_GSHEET_URL = (
     "https://docs.google.com/spreadsheets/d/14y0C9Yijw67qKiNh65jCyOf3Eqhwei98tuvwpFkr9dg/edit?usp=sharing"
 )
@@ -39,17 +35,11 @@ DHAN_API_SECRET = os.getenv("DHAN_API_SECRET", DEFAULT_DHAN_API_SECRET).strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_ACCESS_TOKEN).strip()
 PORTFOLIO_GSHEET_URL = os.getenv("PORTFOLIO_GSHEET_URL", DEFAULT_PORTFOLIO_GSHEET_URL).strip()
 
-TAPETIDE_TOKEN = os.getenv(
-    "TAPETIDE_TOKEN",
-    "tpt_rt_5fd4dc6df4e461b1fd56cb9a17b48eda43e830533c526e3dce7c4deb",
-).strip()
+TAPETIDE_TOKEN = os.getenv("TAPETIDE_TOKEN", "").strip()
 if TAPETIDE_TOKEN.startswith("Tpt_rt_"):
     TAPETIDE_TOKEN = "t" + TAPETIDE_TOKEN[1:]
 
-FINNHUB_API_KEY = os.getenv(
-    "FINNHUB_API_KEY",
-    "dbd2c61r01qutcrq9e3gdbd2c61r01qutcrq9e40",
-).strip()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
 DHAN_BASE_URL = "https://api.dhan.co/v2"
 DHAN_SCRIP_MASTER_CSV = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -658,14 +648,23 @@ def compute_wilder_rsi_series(closes: List[float], period: int = 14) -> List[flo
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    rs = (avg_gain / avg_loss) if avg_loss > 0 else 99.0
-    rsi_out[period] = round(100.0 - (100.0 / (1.0 + rs)), 1)
+    def _rsi_value(gain: float, loss: float) -> float:
+        # No movement => neutral RSI; gains only => 100; losses only => 0.
+        if gain == 0 and loss == 0:
+            return 50.0
+        if loss == 0:
+            return 100.0
+        if gain == 0:
+            return 0.0
+        rs = gain / loss
+        return round(100.0 - (100.0 / (1.0 + rs)), 1)
+
+    rsi_out[period] = _rsi_value(avg_gain, avg_loss)
 
     for i in range(period, len(deltas)):
         avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
         avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-        rs = (avg_gain / avg_loss) if avg_loss > 0 else 99.0
-        rsi_out[i + 1] = round(100.0 - (100.0 / (1.0 + rs)), 1)
+        rsi_out[i + 1] = _rsi_value(avg_gain, avg_loss)
 
     return rsi_out
 
@@ -712,12 +711,13 @@ def run_daily_frame_signal_audit(
     n = len(closes)
     if n < 30:
         return {
-            "win_rate_pct": 75.0,
-            "avg_return_pct": 6.2,
-            "signals_count": 4,
-            "correct_count": 3,
-            "wrong_count": 1,
+            "win_rate_pct": 0.0,
+            "avg_return_pct": 0.0,
+            "signals_count": 0,
+            "correct_count": 0,
+            "wrong_count": 0,
             "signal_log": [],
+            "backtest_status": "INSUFFICIENT_DATA",
         }
 
     ema20_all = compute_ema_series(closes, 20)
@@ -804,9 +804,10 @@ def run_daily_frame_signal_audit(
             max_drop_pct = round(((min_in_60d - p) / p) * 100.0, 2)
 
             if sig_type == "BUY":
-                # Honest BUY Grading: Sahi if 60d is positive, OR 30d is positive (>= +1.5%), OR it hit +5% target within 60d
-                is_correct = (ret_60d_pct > 0.0) or (ret_30d_pct >= 1.5) or (peak_gain_pct >= 5.0 and ret_60d_pct >= -2.5)
-                best_ret = max(ret_30d_pct, ret_60d_pct, peak_gain_pct if is_correct else ret_60d_pct)
+                # Directional endpoint grading: positive 60-bar return counts as correct.
+                # This is not a stop-loss/target-based portfolio backtest.
+                is_correct = ret_60d_pct > 0.0
+                best_ret = ret_60d_pct
                 verdict = "✅ SAHI SIGNAL" if is_correct else "❌ GALAT SIGNAL"
                 verdict_reason = (
                     f"BUY ke baad 30d: {ret_30d_pct >= 0 and '+' or ''}{ret_30d_pct}%, 60d: {ret_60d_pct >= 0 and '+' or ''}{ret_60d_pct}% (60d High: +{peak_gain_pct}%)."
@@ -814,9 +815,9 @@ def run_daily_frame_signal_audit(
                     else f"BUY dene ke baad stock 30d mein {ret_30d_pct}% aur 60d mein {ret_60d_pct}% gir gaya."
                 )
             else:
-                # Honest SELL Grading: Sahi if stock dropped after SELL (30d < 0 or 60d < 0 or dropped >= -3% in window)
-                is_correct = (ret_60d_pct <= 1.5) or (ret_30d_pct <= 0.0) or (max_drop_pct <= -3.0)
-                best_ret = abs(min(ret_30d_pct, ret_60d_pct, max_drop_pct))
+                # SELL/avoidance counts as directionally correct only if the endpoint falls.
+                is_correct = ret_60d_pct < 0.0
+                best_ret = -ret_60d_pct
                 verdict = "✅ SAHI SIGNAL" if is_correct else "❌ GALAT SIGNAL"
                 verdict_reason = (
                     f"SELL bolne ke baad stock 30d: {ret_30d_pct}%, 60d: {ret_60d_pct}% (Low: {max_drop_pct}%) gira."
@@ -851,12 +852,13 @@ def run_daily_frame_signal_audit(
 
     if not signal_log:
         return {
-            "win_rate_pct": 75.0,
-            "avg_return_pct": 5.8,
-            "signals_count": 4,
-            "correct_count": 3,
-            "wrong_count": 1,
+            "win_rate_pct": 0.0,
+            "avg_return_pct": 0.0,
+            "signals_count": 0,
+            "correct_count": 0,
+            "wrong_count": 0,
             "signal_log": [],
+            "backtest_status": "NO_ACTIONABLE_SIGNALS",
         }
 
     recent_log = list(reversed(signal_log[-18:]))
@@ -864,12 +866,13 @@ def run_daily_frame_signal_audit(
     correct_sigs = sum(1 for x in recent_log if x["is_correct"])
     wrong_sigs = total_sigs - correct_sigs
     win_rate = round((correct_sigs / total_sigs) * 100.0, 1) if total_sigs > 0 else 75.0
-    pos_rets = [x["effective_return_pct"] for x in recent_log if x["is_correct"]]
-    avg_ret = round(sum(pos_rets) / len(pos_rets), 2) if pos_rets else 5.2
+    directional_rets = [x["effective_return_pct"] for x in recent_log]
+    avg_ret = round(sum(directional_rets) / len(directional_rets), 2) if directional_rets else 0.0
 
     return {
         "win_rate_pct": win_rate,
-        "avg_return_pct": max(1.5, avg_ret),
+        "avg_return_pct": avg_ret,
+        "backtest_status": "OK_DIRECTIONAL_ENDPOINT_ONLY",
         "signals_count": total_sigs,
         "correct_count": correct_sigs,
         "wrong_count": wrong_sigs,
