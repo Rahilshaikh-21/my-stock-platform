@@ -5,5 +5,4 @@ pydantic-settings==2.5.2
 pandas==2.2.3
 numpy==2.1.1
 httpx==0.27.2
-yfinance==0.2.48
 pytest==8.3.3
