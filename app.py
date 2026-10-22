@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ============================================================================
-# 1. PRE-LOADED DHAN CREDENTIALS (CLIENT ID + API KEY + SECRET + JWT TOKEN)
+# 1. PRE-LOADED DHAN CREDENTIALS & PERMANENT GOOGLE SHEET LINK
 #    (STRICTLY ZERO STOCK OR ETF NAMES HARDCODED ANYWHERE IN THIS CODE)
 # ============================================================================
 
@@ -28,12 +28,15 @@ DEFAULT_DHAN_ACCESS_TOKEN = (
     "eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzkyNzgyMzgxLCJpYXQiOjE3OTI2OTU5ODEsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTEzNzgyOTMyIn0."
     "7JYHzR52yWTDdsjockRnclsBdR0DUhdtNi72qEL7-S7mBNG92TrgKFTXfw5zWuVN5w8Xv9-6dnYeBTKi0H7x3A"
 )
+DEFAULT_PORTFOLIO_GSHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/14y0C9Yijw67qKiNh65jCyOf3Eqhwei98tuvwpFkr9dg/edit?usp=sharing"
+)
 
 DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", DEFAULT_DHAN_CLIENT_ID).strip()
 DHAN_API_KEY = os.getenv("DHAN_API_KEY", DEFAULT_DHAN_API_KEY).strip()
 DHAN_API_SECRET = os.getenv("DHAN_API_SECRET", DEFAULT_DHAN_API_SECRET).strip()
 DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_ACCESS_TOKEN).strip()
-PORTFOLIO_GSHEET_URL = os.getenv("PORTFOLIO_GSHEET_URL", "").strip()
+PORTFOLIO_GSHEET_URL = os.getenv("PORTFOLIO_GSHEET_URL", DEFAULT_PORTFOLIO_GSHEET_URL).strip()
 
 TAPETIDE_TOKEN = os.getenv(
     "TAPETIDE_TOKEN",
@@ -158,7 +161,7 @@ def _parse_clean_float(val_str: str) -> float:
 
 
 # ============================================================================
-# 2. DHAN LIVE HOLDINGS + GOOGLE SHEET PORTFOLIO & 12-HR TOKEN AUTO-SYNCER
+# 2. DHAN LIVE HOLDINGS + FIXED MULTI-ROW GOOGLE SHEET & 12-HR TOKEN SYNCER
 # ============================================================================
 
 async def sync_dhan_live_holdings_into_portfolio() -> int:
@@ -200,7 +203,14 @@ async def sync_dhan_live_holdings_into_portfolio() -> int:
 
 
 async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) -> Dict[str, Any]:
-    target_url = (sheet_url or BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url") or "").strip()
+    """
+    Fixed Multi-Row Google Sheet Parser + 12-Hour JWT Token Scanner:
+    1. Scans Instruments, Transactions, Dashboard, Config, and Token tabs.
+    2. Automatically extracts any renewed Dhan JWT token ('eyJ0eXAi...') updated every 12 hours.
+    3. Handles merged/multi-row headers from Google Visualization CSV exports so
+       all active holdings (Qty > 0) are accurately imported.
+    """
+    target_url = (sheet_url or BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url") or DEFAULT_PORTFOLIO_GSHEET_URL).strip()
     if not target_url:
         return {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0}
 
@@ -214,6 +224,9 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
         urls_to_check = [
             f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Instruments",
             f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Transactions",
+            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Dashboard",
+            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Token",
+            f"https://docs.google.com/spreadsheets/d/{doc_id}/gviz/tq?tqx=out:csv&sheet=Config",
             f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv",
         ]
 
@@ -228,42 +241,53 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
     for csv_url in urls_to_check:
         try:
             r = await client.get(csv_url, headers=BROWSER_HEADERS, timeout=7.0)
-            if r.status_code != 200 or not r.text:
+            if r.status_code != 200 or not r.text or "<!DOCTYPE html>" in r.text[:200]:
                 continue
 
+            # 1. Scan for renewed 12-hour Dhan JWT token ('eyJ...') anywhere in the sheet
             jwt_matches = JWT_TOKEN_PATTERN.findall(r.text)
             if jwt_matches:
-                BROKER_RUNTIME_CONFIG["dhan_access_token"] = jwt_matches[-1].strip()
+                latest_jwt = jwt_matches[-1].strip()
+                if latest_jwt != BROKER_RUNTIME_CONFIG.get("dhan_access_token"):
+                    token_updated = True
+                BROKER_RUNTIME_CONFIG["dhan_access_token"] = latest_jwt
                 BROKER_RUNTIME_CONFIG["last_token_sync"] = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-                token_updated = True
 
+            # 2. Parse CSV rows (Supports both standard CSV and gviz merged-header CSV)
             reader = csv.reader(io.StringIO(r.text))
             rows = list(reader)
             header_idx = -1
-            col_map: Dict[str, int] = {}
+            sym_idx = -1
+            qty_idx = -1
+            cost_idx = -1
+            type_idx = -1
 
             for r_i, row in enumerate(rows[:15]):
-                lowered = [c.strip().lower() for c in row]
-                if "symbol" in lowered and any("qty" in c for c in lowered):
+                lowered = [re.sub(r"\s+", " ", c.strip().lower()) for c in row]
+                has_sym = any(c == "symbol" or c.endswith(" symbol") for c in lowered)
+                has_qty = any("qty" in c for c in lowered)
+                if has_sym and has_qty:
                     header_idx = r_i
-                    for c_i, col_name in enumerate(lowered):
-                        col_map[col_name] = c_i
+                    for c_i, col_text in enumerate(lowered):
+                        if sym_idx == -1 and (col_text == "symbol" or col_text.endswith(" symbol")):
+                            sym_idx = c_i
+                        if qty_idx == -1 and ("qty held" in col_text or col_text == "qty" or col_text.endswith(" qty")):
+                            qty_idx = c_i
+                        if cost_idx == -1 and ("avg buy cost" in col_text or "price per unit" in col_text):
+                            cost_idx = c_i
+                        if type_idx == -1 and ("type" in col_text):
+                            type_idx = c_i
                     break
 
-            if header_idx >= 0:
-                sym_idx = col_map.get("symbol", 0)
-                qty_idx = next((idx for k, idx in col_map.items() if "qty" in k), -1)
-                cost_idx = next((idx for k, idx in col_map.items() if "avg buy" in k or "price per unit" in k), -1)
-                type_idx = next((idx for k, idx in col_map.items() if "type" in k), -1)
-
+            if header_idx >= 0 and sym_idx >= 0 and qty_idx >= 0:
                 for data_row in rows[header_idx + 1 :]:
-                    if len(data_row) <= sym_idx:
+                    if len(data_row) <= max(sym_idx, qty_idx):
                         continue
-                    raw_sym = data_row[sym_idx].strip().upper()
-                    if not raw_sym or len(raw_sym) > 15 or " " in raw_sym or raw_sym in ("TOTAL", "SYMBOL"):
+                    raw_sym = data_row[sym_idx].strip().upper().replace("NSE:", "").replace("BSE:", "")
+                    if not raw_sym or len(raw_sym) > 15 or " " in raw_sym or raw_sym in ("TOTAL", "SYMBOL", "-"):
                         continue
 
-                    qty_val = _parse_clean_float(data_row[qty_idx]) if (qty_idx >= 0 and len(data_row) > qty_idx) else 0.0
+                    qty_val = _parse_clean_float(data_row[qty_idx])
                     cost_val = _parse_clean_float(data_row[cost_idx]) if (cost_idx >= 0 and len(data_row) > cost_idx) else 0.0
                     row_type = data_row[type_idx].strip().upper() if (type_idx >= 0 and len(data_row) > type_idx) else ""
 
@@ -318,10 +342,10 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
 
 
 async def periodic_12hr_sync_loop() -> None:
+    """Checks Google Sheet & Dhan API every 30 minutes so 12-hour token updates happen automatically."""
     while True:
         await asyncio.sleep(1800)
-        if BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url"):
-            await sync_portfolio_and_token_from_gsheet()
+        await sync_portfolio_and_token_from_gsheet()
         await sync_dhan_live_holdings_into_portfolio()
 
 
@@ -388,7 +412,7 @@ async def fetch_dhan_daily_candles(symbol: str) -> Optional[Dict[str, Any]]:
     }
     try:
         r = await client.post(f"{DHAN_BASE_URL}/charts/historical", json=payload, headers=headers, timeout=5.0)
-        if r.status_code == 401 and BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url"):
+        if r.status_code == 401:
             await sync_portfolio_and_token_from_gsheet()
             headers["access-token"] = BROKER_RUNTIME_CONFIG.get("dhan_access_token", "")
             r = await client.post(f"{DHAN_BASE_URL}/charts/historical", json=payload, headers=headers, timeout=5.0)
@@ -506,18 +530,6 @@ def run_daily_frame_signal_audit(
     is_etf: bool,
     curr_sym: str,
 ) -> Dict[str, Any]:
-    """
-    HONEST DAILY-FRAME POINT-IN-TIME BACKTEST ENGINE (v17.0):
-    1. Trend-Confirmed Signal Rules:
-       - Never fires BUY/STRONG BUY in a falling knife while Price < 20-EMA and 5-day momentum < 0.
-       - Never fires BUY above Fair Value right after a climax peak.
-    2. Brutally Honest Grading (No `closes[-1] > p` look-ahead bias!):
-       - BUY / STRONG BUY is `✅ SAHI SIGNAL` ONLY if 60-day return >= +2.0% OR (30-day >= +2.0% AND 60-day >= 0%).
-         If 60-day return is negative (like -8.63% or -8.95%), it is strictly graded `❌ GALAT SIGNAL`!
-       - WAIT FOR BOUNCE is `✅ SAHI SIGNAL` ONLY if the stock actually fell or stayed weak over 30d/60d.
-         If the stock rallied > +5% by 60d (like +17.6%), WAIT is strictly graded `❌ GALAT SIGNAL (Missed Rally)`!
-       - SELL / BOOK PROFIT is `✅ SAHI SIGNAL` ONLY if 30d or 60d return was negative or flat (< +3%).
-    """
     n = len(closes)
     if n < 55:
         return {
@@ -570,7 +582,6 @@ def run_daily_frame_signal_audit(
 
         drop_from_high = ((h_52w - p) / h_52w * 100.0) if h_52w > 0 else 0.0
 
-        # Trend & Turn Confirmation Filters (Prevents buying a falling knife like 03 Nov 2025 or post-climax 16 Sep 2026)
         has_uptrend_or_turn = (p >= e20) or (p > p_5d_ago * 1.015 and rsi_val >= rsi_5d_ago + 2.5)
         in_post_climax_cooldown = (i - last_sell_climax_idx) <= 18 and (p < e20)
 
@@ -607,9 +618,7 @@ def run_daily_frame_signal_audit(
             ret_30d_pct = round(((price_after_30d - p) / p) * 100.0, 2)
             ret_60d_pct = round(((price_after_60d - p) / p) * 100.0, 2)
 
-            # STRICT, BRUTALLY HONEST GRADING BASED DIRECTLY ON 30-DAY & 60-DAY OUTCOMES
             if sig_type == "BUY":
-                # A BUY is ONLY Sahi if 60d return is positive (>= +1.5%), OR 30d return was strong (>= +3.0%) and 60d didn't turn negative!
                 is_correct = (ret_60d_pct >= 1.5) or (ret_30d_pct >= 3.0 and ret_60d_pct >= 0.0)
                 best_ret = ret_60d_pct if ret_60d_pct >= ret_30d_pct else ret_30d_pct
                 verdict = "✅ SAHI SIGNAL" if is_correct else "❌ GALAT SIGNAL"
@@ -619,7 +628,6 @@ def run_daily_frame_signal_audit(
                     else f"BUY dene ke baad stock gir gaya (30d: {ret_30d_pct}%, 60d: {ret_60d_pct}%) — Signal Galat Raha."
                 )
             elif sig_type == "SELL":
-                # A SELL is Sahi ONLY if stock dropped after 30d or 60d (or gained less than +2.5%)
                 is_correct = (ret_60d_pct <= 2.0) or (ret_30d_pct <= -2.0)
                 best_ret = -min(ret_30d_pct, ret_60d_pct)
                 verdict = "✅ SAHI SIGNAL" if is_correct else "❌ GALAT SIGNAL"
@@ -629,7 +637,6 @@ def run_daily_frame_signal_audit(
                     else f"SELL bolne ke baad bhi stock 60d mein +{ret_60d_pct}% upar chala gaya — Jaldi Exit Hua."
                 )
             elif sig_type == "WAIT":
-                # WAIT is Sahi ONLY if stock stayed weak/negative (60d <= +3.5%). If it rallied +17.6% in 60d, WAIT was WRONG!
                 is_correct = (ret_60d_pct <= 3.5) and (ret_30d_pct <= 3.5)
                 best_ret = -min(ret_30d_pct, ret_60d_pct)
                 verdict = "✅ SAHI SIGNAL" if is_correct else "❌ GALAT SIGNAL"
@@ -639,7 +646,6 @@ def run_daily_frame_signal_audit(
                     else f"WAIT bolne ke baad stock 60d mein +{ret_60d_pct}% bhaag gaya — Rally Miss Hui."
                 )
             else:
-                # HOLD & COMPOUND is Sahi ONLY if 60d return >= 0% OR 30d return >= +4% with 60d >= -2%
                 is_correct = (ret_60d_pct >= 0.0) or (ret_30d_pct >= 4.0 and ret_60d_pct >= -2.0)
                 best_ret = max(ret_30d_pct, ret_60d_pct)
                 verdict = "✅ SAHI SIGNAL" if is_correct else "❌ GALAT SIGNAL"
@@ -703,7 +709,7 @@ def run_daily_frame_signal_audit(
 
 
 # ============================================================================
-# 4. SEPARATE ETF NAV ENGINE & STOCK FUND-MANAGER ENGINE (WITH TURN CONFIRMATION)
+# 4. SEPARATE ETF NAV ENGINE & STOCK FUND-MANAGER ENGINE
 # ============================================================================
 
 def evaluate_institutional_engine(
@@ -762,7 +768,6 @@ def evaluate_institutional_engine(
     drop_from_high_pct = round(((high_52w - price) / high_52w * 100.0), 1) if high_52w > 0 else 0.0
     bounce_from_low_pct = round(((price - low_52w) / low_52w * 100.0), 1) if low_52w > 0 else 0.0
 
-    # Honest Daily-Frame Signal Backtest Audit
     bt_stats = run_daily_frame_signal_audit(closes_3y, timestamps_3y, is_etf, curr_sym)
 
     if is_etf:
@@ -843,7 +848,6 @@ def evaluate_institutional_engine(
             or (eff_roic < 6.5 and price < ema_200 and change_3yr_pct < -12.0)
         )
 
-        # Trend Turn Confirmation Check: Is price above 20-EMA OR bouncing with rising RSI?
         has_trend_or_turn_confirmation = (price >= ema_20) or (price > price_5d_ago * 1.015 and rsi_14 >= rsi_5d_ago + 2.0 and change_pct >= 0.0)
         is_falling_without_turn = (price < ema_20 < ema_50) and (not has_trend_or_turn_confirmation) and (macd_hist < 0)
 
@@ -1340,8 +1344,7 @@ async def build_filtered_universe(market_filter: str, force_refresh: bool = Fals
 async def lifespan(app: FastAPI):
     asyncio.create_task(load_dhan_scrip_master_once())
     asyncio.create_task(sync_dhan_live_holdings_into_portfolio())
-    if BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url"):
-        asyncio.create_task(sync_portfolio_and_token_from_gsheet())
+    asyncio.create_task(sync_portfolio_and_token_from_gsheet())
     asyncio.create_task(periodic_12hr_sync_loop())
     asyncio.create_task(build_filtered_universe("ALL", force_refresh=False))
     yield
@@ -1354,8 +1357,8 @@ async def lifespan(app: FastAPI):
 # ============================================================================
 
 app = FastAPI(
-    title="Institutional Fund Manager, Honest Backtest Grader & Dhan Auto-Sync AI",
-    version="17.0.0-honest-backtest",
+    title="Institutional Fund Manager, Honest Backtest Grader & Dhan 12-Hr Auto-Sync AI",
+    version="18.0.0-permanent-gsheet-sync",
     lifespan=lifespan,
 )
 
@@ -1394,10 +1397,8 @@ async def connect_broker_and_portfolio_sheet(req: BrokerConnectInput):
         BROKER_RUNTIME_CONFIG["dhan_access_token"] = req.dhan_access_token.strip()
         BROKER_RUNTIME_CONFIG["last_token_sync"] = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
 
-    sheet_stats = {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0}
-    if req.portfolio_gsheet_url:
-        sheet_stats = await sync_portfolio_and_token_from_gsheet(req.portfolio_gsheet_url.strip())
-
+    target_sheet = req.portfolio_gsheet_url.strip() or BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url", "")
+    sheet_stats = await sync_portfolio_and_token_from_gsheet(target_sheet)
     dhan_holdings_count = await sync_dhan_live_holdings_into_portfolio()
 
     UNIVERSE_CACHE.clear()
@@ -1410,6 +1411,7 @@ async def connect_broker_and_portfolio_sheet(req: BrokerConnectInput):
         "dhan_active": bool(BROKER_RUNTIME_CONFIG.get("dhan_access_token")),
         "dhan_holdings_synced": dhan_holdings_count,
         "sheet_sync": sheet_stats,
+        "total_portfolio_holdings": len(PORTFOLIO_STORE),
         "last_token_sync": BROKER_RUNTIME_CONFIG.get("last_token_sync"),
     }
 
@@ -1618,7 +1620,7 @@ async def delete_portfolio(symbol: str):
 
 
 # ============================================================================
-# 7. FRONTEND UI (HONEST BACKTEST GRADER + DHAN & PORTFOLIO GSHEET SYNC)
+# 7. FRONTEND UI (PERMANENT GSHEET LINK + HONEST BACKTEST GRADER)
 # ============================================================================
 
 FRONTEND_HTML = """<!DOCTYPE html>
@@ -1646,7 +1648,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     <div class="flex items-center gap-2 flex-wrap">
       <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span>HONEST 30D/60D BACKTEST GRADER + TREND-CONFIRMED ENGINE ACTIVE</span>
+        <span>DHANHQ (1113782932) + 12-HR GSHEET AUTO-SYNC ACTIVE</span>
       </span>
       <span id="badge-in-session" class="text-slate-300 font-mono">🇮🇳 India API: Connecting...</span>
       <span class="text-slate-600">|</span>
@@ -1654,7 +1656,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     </div>
     <div class="flex items-center gap-2">
       <button onclick="openBrokerModal()" id="brokerStatusBtn" class="px-2.5 py-1 rounded bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-xs font-semibold transition">
-        🔗 Sync Dhan &amp; Portfolio G-Sheet
+        ✓ Dhan &amp; G-Sheet Pre-Linked (12-Hr Auto-Sync)
       </button>
       <button onclick="loadUniverse(true)" class="px-3 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition">
         🔄 Rescan Live Market
@@ -1672,9 +1674,9 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div>
           <div class="flex items-center gap-2">
             <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">Institutional Fund Manager &amp; Honest Daily Backtest AI</h1>
-            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v17.0 Strict Audit</span>
+            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v18.0 Auto-Sync</span>
           </div>
-          <p class="text-xs text-slate-400">Strict 30D &amp; 60D Signal Verification (Negative 60D Return on BUY = ❌ GALAT SIGNAL) • Trend-Confirmed Entries</p>
+          <p class="text-xs text-slate-400">Strict 30D &amp; 60D Signal Verification • Permanent Google Sheet &amp; DhanHQ 12-Hour Sync</p>
         </div>
       </div>
 
@@ -1822,14 +1824,14 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <button onclick="document.getElementById('brokerModal').classList.add('hidden')" class="px-2.5 py-1 rounded bg-slate-800 font-bold">✕</button>
       </div>
       <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5 text-slate-300">
-        <div class="font-bold text-emerald-400">Automatic Portfolio &amp; 12-Hour Token Sync:</div>
-        <div>• Paste your <strong>Portfolio_Tracker Rahil</strong> Google Sheet link below.</div>
-        <div>• It will automatically import all your active holdings into <strong>My Portfolio</strong> and auto-sync your renewed Dhan token every 12 hours!</div>
+        <div class="font-bold text-emerald-400">Permanent Portfolio &amp; 12-Hour Token Sync Active:</div>
+        <div>• Your <strong>Portfolio_Tracker Rahil</strong> Google Sheet link is now pre-saved below!</div>
+        <div>• Make sure your Google Sheet sharing is set to <strong>"Anyone with the link"</strong> so the server can read it every 12 hours without login.</div>
       </div>
       <div class="grid grid-cols-1 gap-2.5">
         <div>
-          <label class="text-slate-400 block mb-1">Portfolio Tracker Google Sheet Link</label>
-          <input id="portfolioGsheetUrlInput" type="text" placeholder="Paste your Google Sheet share link here..." class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-white" />
+          <label class="text-slate-400 block mb-1">Portfolio Tracker Google Sheet Link (Pre-Saved)</label>
+          <input id="portfolioGsheetUrlInput" type="text" value="https://docs.google.com/spreadsheets/d/14y0C9Yijw67qKiNh65jCyOf3Eqhwei98tuvwpFkr9dg/edit?usp=sharing" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 font-mono text-white" />
         </div>
         <div class="grid grid-cols-2 gap-2">
           <div>
@@ -1876,7 +1878,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       const box = document.getElementById('toastBox');
       box.innerText = msg;
       box.classList.remove('hidden');
-      setTimeout(() => box.classList.add('hidden'), 3500);
+      setTimeout(() => box.classList.add('hidden'), 4000);
     }
 
     function openBrokerModal() {
@@ -1898,7 +1900,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
         const out = await res.json();
         document.getElementById('brokerModal').classList.add('hidden');
         const importedPos = (out.sheet_sync && out.sheet_sync.positions_imported) || 0;
-        showToast(`✓ Connected! Imported ${importedPos} Portfolio Holdings & ${out.dhan_holdings_synced} Dhan Holdings!`);
+        const totalActive = out.total_portfolio_holdings || 0;
+        showToast(`✓ Synced! Sheet Positions: ${importedPos} | Dhan Positions: ${out.dhan_holdings_synced} | Total Active Portfolio: ${totalActive}`);
         refreshCounts();
         loadUniverse(true);
       }
@@ -2272,7 +2275,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       `;
 
       if (!data.positions || data.positions.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-slate-400">Your Portfolio is empty. Click <strong>🔗 Sync Dhan &amp; Portfolio G-Sheet</strong> at the top to import your Google Sheet positions automatically!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-slate-400">Your Portfolio is empty. Click <strong>✓ Dhan &amp; G-Sheet Pre-Linked</strong> at the top to sync!</td></tr>`;
         return;
       }
       tbody.innerHTML = data.positions.map(p => {
