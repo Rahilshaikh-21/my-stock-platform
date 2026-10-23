@@ -2747,7 +2747,12 @@ def apply_user_chat_overrides_to_payload(payload: Dict[str, Any]) -> Dict[str, A
     curr_sym = payload["currency_symbol"]
     price = float(payload["price"])
 
-    if "fair_value" in ovr and ovr["fair_value"] is not None:
+    # Chat instructions are not an evidence source. Never let conversational
+    # overrides change fair value or downstream valuation-derived signals.
+    ovr.pop("fair_value", None)
+    ovr.pop("safe_buy_limit", None)
+    ovr.pop("sell_trigger_limit", None)
+    if False and "fair_value" in ovr and ovr["fair_value"] is not None:
         fv = round(float(ovr["fair_value"]), 2)
         payload["fair_value"] = fv
         payload["intrinsic_value_low"] = round(fv * 0.90, 2)
