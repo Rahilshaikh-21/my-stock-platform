@@ -258,6 +258,150 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         self.assertLess(eval_out["mos_pct"], 0.0)
         self.assertIn(eval_out["decision_category"], ("HOLD", "SELL"))
 
+    def test_hdfcbank_screenshot_fair_value_and_swing_rsi_consistency(self):
+        # Exact inputs from live HDFCBANK screenshot:
+        # Live Price = 695.25, P/E = 13.4, EPS = 51.88, ROE = 13.6%, Book Value = 391.0, 3Y ago = 753.03
+        closes = [753.03 + (i % 9 - 4) * 3.5 for i in range(500)] + [788.93 - i * 0.45 for i in range(195)] + [690.0, 692.0, 694.0, 693.5, 695.25]
+        fund = platform.validate_and_reconcile_fundamentals(
+            symbol="HDFCBANK",
+            company_name="HDFC Bank Limited",
+            country="IN",
+            live_price=695.25,
+            closes_3y=closes,
+            raw_metrics={"pe": 13.4, "roe": 13.6, "book_value": 391.0},
+            source_tag="SCREENER_LIVE",
+        )
+        out = platform.evaluate_institutional_engine(
+            symbol="HDFCBANK",
+            name="HDFC Bank Limited",
+            country="IN",
+            exchange="NSE",
+            currency="INR",
+            asset_type="EQUITY",
+            price=695.25,
+            prev_close=694.07,
+            change_pct=0.17,
+            closes_3y=closes,
+            timestamps_3y=[],
+            vol_ratio=0.5,
+            real_fundamentals=fund,
+            provider_name="NSE_BSE_LIVE_API",
+        )
+        # 1. Stage-1 growth must be positive Sustainable Growth Rate (~10.6%), never negative (-1.76%) from 3Y price drop
+        self.assertGreater(out["valuation_assumptions"]["assumed_stage1_growth_pct"], 8.0)
+        # 2. Fair Value must reflect 1.9x-2.1x Book Value and 17x-19x EPS (~₹830-₹880), well above ₹695.25
+        self.assertGreater(out["fair_value"], 800.0)
+        self.assertGreater(out["mos_pct"], 12.0)
+        self.assertEqual(out["decision_category"], "BUY")
+        self.assertIn("BUY", out["short_signal"])
+        # 3. Swing setup must NEVER claim 'Overbought RSI >= 74' when RSI(14) < 74
+        self.assertLess(out["rsi_14"], 74.0)
+        self.assertNotIn("Overbought RSI", out["sw_setup"])
+
+    def test_closed_loop_gemini_verifier_corrects_wrong_buy_sell_and_fair_value(self):
+        # 1. Simulate the exact buggy HDFCBANK payload from the screenshot:
+        # Depressed Fair Value ₹495.63, false 'SELL / BOOK PROFIT', and false 'Overbought RSI >= 74' with RSI=41.9
+        buggy_hdfc_payload = {
+            "symbol": "HDFCBANK",
+            "name": "HDFC Bank Limited",
+            "country": "IN",
+            "exchange": "NSE",
+            "currency": "INR",
+            "currency_symbol": "₹",
+            "raw_asset_type": "EQUITY",
+            "price": 695.25,
+            "fair_value": 495.63,
+            "safe_buy_limit": 421.29,
+            "sell_trigger_limit": 604.67,
+            "mos_pct": -40.3,
+            "pe_ratio": 13.4,
+            "pb_ratio": 1.78,
+            "book_value": 391.0,
+            "roic_pct": 13.6,
+            "roe_pct": 13.6,
+            "debt_to_equity": 0.0,
+            "wacc_pct": 11.24,
+            "cost_of_equity_pct": 11.24,
+            "is_bank_or_fin": True,
+            "is_value_trap": False,
+            "fundamentals_verified": True,
+            "short_signal": "SELL / BOOK PROFIT",
+            "action_badge": "🔴💰 SELL / BOOK PROFIT",
+            "decision_category": "SELL",
+            "lt_confidence": 38.0,
+            "sw_state": "SELL / BOOK",
+            "sw_setup": "Overbought RSI >= 74 / Momentum Exhaustion",
+            "sw_confidence": 40.0,
+            "sw_stop": 672.69,
+            "sw_target": 744.88,
+            "rsi_14": 41.9,
+            "macd_hist": -1.29,
+            "ema_20": 711.17,
+            "ema_50": 721.41,
+            "ema_200": 788.93,
+            "change_pct": 0.17,
+            "discrepancies": [],
+            "valuation_assumptions": {},
+        }
+        corrected = platform.run_gemini_closed_loop_signal_verifier(buggy_hdfc_payload)
+        self.assertGreater(corrected["fair_value"], 780.0)
+        self.assertEqual(corrected["decision_category"], "BUY")
+        self.assertIn("BUY", corrected["short_signal"])
+        self.assertNotIn("Overbought RSI", corrected["sw_setup"])
+        self.assertGreaterEqual(corrected["ai_verification"]["auto_corrections_count"], 2)
+        codes = [c["code"] for c in corrected["ai_verification"]["auto_corrections"]]
+        self.assertIn("VALUATION_UNDERESTIMATE_AUTO_CORRECTED", codes)
+        self.assertIn("SWING_RSI_LABEL_CONTRADICTION_FIXED", codes)
+
+        # 2. Simulate a false BUY signal on an overvalued stock (Price ₹1,500 vs Fair Value ₹950)
+        # and a false Swing BUY when RSI(14) = 78.5 (overbought)
+        false_buy_payload = {
+            "symbol": "OVERVALUEDCO",
+            "name": "Overvalued Corp",
+            "country": "IN",
+            "exchange": "NSE",
+            "currency": "INR",
+            "currency_symbol": "₹",
+            "raw_asset_type": "EQUITY",
+            "price": 1500.0,
+            "fair_value": 950.0,
+            "safe_buy_limit": 807.5,
+            "sell_trigger_limit": 1159.0,
+            "mos_pct": -57.9,
+            "pe_ratio": 55.0,
+            "roic_pct": 14.0,
+            "roe_pct": 14.0,
+            "wacc_pct": 11.0,
+            "cost_of_equity_pct": 11.0,
+            "is_bank_or_fin": False,
+            "is_value_trap": False,
+            "fundamentals_verified": True,
+            "short_signal": "STRONG BUY",
+            "action_badge": "🟢🔥 STRONG BUY",
+            "decision_category": "BUY",
+            "lt_confidence": 90.0,
+            "sw_state": "STRONG BUY",
+            "sw_setup": "Breakout",
+            "sw_confidence": 85.0,
+            "sw_stop": 1440.0,
+            "sw_target": 1620.0,
+            "rsi_14": 78.5,
+            "macd_hist": 2.1,
+            "ema_20": 1420.0,
+            "ema_50": 1360.0,
+            "ema_200": 1200.0,
+            "change_pct": 1.5,
+            "discrepancies": [],
+            "valuation_assumptions": {},
+        }
+        fixed_overval = platform.run_gemini_closed_loop_signal_verifier(false_buy_payload)
+        self.assertEqual(fixed_overval["decision_category"], "SELL")
+        self.assertNotIn("BUY", fixed_overval["short_signal"])
+        self.assertNotIn("BUY", fixed_overval["sw_state"])
+        overval_codes = [c["code"] for c in fixed_overval["ai_verification"]["auto_corrections"]]
+        self.assertIn("FALSE_BUY_SIGNAL_PREVENTED", overval_codes)
+        self.assertIn("SWING_OVERBOUGHT_BUY_PREVENTED", overval_codes)
+
 
 class TestTechnicalIndicatorsAndZeroLookaheadBacktest(unittest.TestCase):
     """Tests Section 6 & 12: Split adjuster, Wilder RSI, True ATR(14), and Zero-Lookahead Backtesting."""
