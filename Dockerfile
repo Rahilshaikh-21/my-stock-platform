@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY schema.sql .
+COPY test_app.py .
+RUN python3 -m unittest test_app.py
 
 RUN chown -R appuser:appuser /app
 USER appuser
