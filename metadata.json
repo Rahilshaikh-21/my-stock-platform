@@ -1,6 +1,0 @@
-{
-  "name": "Stock Platform",
-  "description": "Institutional value investing, swing trading scanner, portfolio ledger, and stock valuation analyzer",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
