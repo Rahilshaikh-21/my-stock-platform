@@ -2748,41 +2748,11 @@ def apply_user_chat_overrides_to_payload(payload: Dict[str, Any]) -> Dict[str, A
     price = float(payload["price"])
 
     # Chat instructions are not an evidence source. Never let conversational
-    # overrides change fair value or downstream valuation-derived signals.
+    # overrides change fair value, valuation thresholds, or BUY/SELL signals.
     ovr.pop("fair_value", None)
     ovr.pop("safe_buy_limit", None)
     ovr.pop("sell_trigger_limit", None)
-    if False and "fair_value" in ovr and ovr["fair_value"] is not None:
-        fv = round(float(ovr["fair_value"]), 2)
-        payload["fair_value"] = fv
-        payload["intrinsic_value_low"] = round(fv * 0.90, 2)
-        payload["intrinsic_value_high"] = round(fv * 1.12, 2)
-        payload["safe_buy_limit"] = round(min(fv - 0.01, fv * 0.85), 2)
-        payload["sell_trigger_limit"] = round(max(fv + 0.01, fv * 1.22), 2)
-        payload["mos_pct"] = round(((fv - price) / fv) * 100.0, 1) if fv > 0 else 0.0
 
-        if "short_signal" not in ovr:
-            if price <= payload["safe_buy_limit"]:
-                payload["short_signal"] = "STRONG BUY"
-                payload["action_badge"] = f"🟢🔥 STRONG BUY (User Verified Fair Value {curr_sym}{fv} — High MoS!)"
-                payload["decision_category"] = "BUY"
-            elif price <= fv:
-                payload["short_signal"] = "BUY"
-                payload["action_badge"] = f"🟢 BUY / ACCUMULATE (Below User Verified Fair Value {curr_sym}{fv})"
-                payload["decision_category"] = "BUY"
-            elif price >= payload["sell_trigger_limit"]:
-                payload["short_signal"] = "SELL / BOOK PROFIT"
-                payload["action_badge"] = f"🔴💰 SELL / BOOK PROFIT (Above Target {curr_sym}{payload['sell_trigger_limit']})"
-                payload["decision_category"] = "SELL"
-            else:
-                payload["short_signal"] = "HOLD & COMPOUND"
-                payload["action_badge"] = f"🟡 HOLD & COMPOUND (Near Fair Value {curr_sym}{fv})"
-                payload["decision_category"] = "HOLD"
-
-    if "safe_buy_limit" in ovr and ovr["safe_buy_limit"] is not None:
-        payload["safe_buy_limit"] = round(float(ovr["safe_buy_limit"]), 2)
-    if "sell_trigger_limit" in ovr and ovr["sell_trigger_limit"] is not None:
-        payload["sell_trigger_limit"] = round(float(ovr["sell_trigger_limit"]), 2)
     if "sw_stop" in ovr and ovr["sw_stop"] is not None:
         payload["sw_stop"] = round(float(ovr["sw_stop"]), 2)
     if "sw_target" in ovr and ovr["sw_target"] is not None:
