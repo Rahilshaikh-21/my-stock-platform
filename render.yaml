@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: ai-stock-research-platform
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/v1/system/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DHAN_CLIENT_ID
+        sync: false
+      - key: DHAN_API_KEY
+        sync: false
+      - key: DHAN_API_SECRET
+        sync: false
+      - key: DHAN_ACCESS_TOKEN
+        sync: false
+      - key: PORTFOLIO_GSHEET_URL
+        sync: false
+      - key: TAPETIDE_TOKEN
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
