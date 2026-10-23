@@ -5218,31 +5218,53 @@ Ask me any question below, or tell me to update any metric/signal (e.g. <em>"Set
       }).join('');
     }
 
-    async function addPortfolioManual() {
-      const symbol = document.getElementById('pfSym').value.trim();
+    async async function addPortfolioManual() {
+      const symbol = document.getElementById('pfSym').value.trim().toUpperCase();
       const exchange = document.getElementById('pfExch').value;
-      const quantity = parseFloat(document.getElementById('pfQty').value) || 10;
+      const quantityText = document.getElementById('pfQty').value.trim();
+      const quantity = Number(quantityText);
       const rawAvgStr = document.getElementById('pfAvg').value.trim();
-      const avg_buy_price = rawAvgStr && parseFloat(rawAvgStr) > 0 ? parseFloat(rawAvgStr) : null;
-      if (!symbol) return;
-      const btn = document.getElementById('pfAddBtn');
-      btn.innerText = 'Saving...';
-      const res = await fetch('/api/v1/portfolio', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({symbol, exchange, quantity, avg_buy_price, use_live_price_as_cost: false})
-      });
-      btn.innerText = '+ Add Holding';
-      if (!res.ok) {
-        let detail = 'Could not add holding.';
-        try { const err = await res.json(); detail = err.detail || detail; } catch (_) {}
-        showToast(`⚠ ${detail}`, true);
+      const parsedAvg = rawAvgStr ? Number(rawAvgStr) : null;
+      const avg_buy_price = parsedAvg !== null && Number.isFinite(parsedAvg) && parsedAvg > 0 ? parsedAvg : null;
+
+      if (!symbol) {
+        showToast('⚠ Enter a stock or ETF symbol first.', true);
         return;
       }
-      document.getElementById('pfSym').value = '';
-      document.getElementById('pfAvg').value = '';
-      showToast(`✓ ${symbol.toUpperCase()} saved to Portfolio!`);
-      renderPortfolio();
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        showToast('⚠ Quantity must be a number greater than zero.', true);
+        return;
+      }
+      if (rawAvgStr && (!Number.isFinite(parsedAvg) || parsedAvg <= 0)) {
+        showToast('⚠ Average buy price must be a positive number, or leave it blank if unknown.', true);
+        return;
+      }
+
+      const btn = document.getElementById('pfAddBtn');
+      const originalLabel = btn.innerText;
+      btn.disabled = true;
+      btn.innerText = 'Saving...';
+      try {
+        const res = await fetch('/api/v1/portfolio', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({symbol, exchange, quantity, avg_buy_price, use_live_price_as_cost: false})
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(`⚠ ${out.detail || 'Could not add holding.'}`, true);
+          return;
+        }
+        await renderPortfolio();
+        document.getElementById('pfSym').value = '';
+        document.getElementById('pfAvg').value = '';
+        showToast(`✓ ${symbol} saved to Portfolio! Quantity: ${out.quantity}`);
+      } catch (err) {
+        showToast('⚠ Could not reach the portfolio API. Check Render logs and try again.', true);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = originalLabel;
+      }
     }
 
     async function removePortfolio(sym) {
