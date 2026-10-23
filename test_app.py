@@ -1,6 +1,6 @@
+import asyncio
 import math
 import unittest
-from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 import app as platform
@@ -14,17 +14,16 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         platform.SYMBOL_CACHE.clear()
         platform.FUNDAMENTALS_CACHE.clear()
         platform.UNIVERSE_CACHE.clear()
+        platform.USER_STOCK_OVERRIDES.clear()
+        platform.STOCK_CHAT_HISTORY.clear()
 
     def test_parse_optional_float_distinguishes_zero_from_missing(self):
-        # Legitimate zero values must be preserved as 0.0, never discarded as None
         self.assertEqual(platform._parse_optional_float("0"), 0.0)
         self.assertEqual(platform._parse_optional_float("0.00%"), 0.0)
         self.assertEqual(platform._parse_optional_float("₹0"), 0.0)
         self.assertEqual(platform._parse_optional_float(0), 0.0)
-        # Trailing dot format from Google Sheets ('117.', '18.')
         self.assertEqual(platform._parse_optional_float("117."), 117.0)
         self.assertEqual(platform._parse_optional_float("(₹1,250.50)"), -1250.50)
-        # Placeholders and missing indicators must return None, never 0.0
         for missing_val in (None, "", "-", "—", "–", "N/A", "null", "NaN", float("nan"), float("inf")):
             self.assertIsNone(platform._parse_optional_float(missing_val))
 
@@ -45,7 +44,6 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         self.assertIsNone(res["roic"])
         self.assertIsNone(res["roe"])
 
-        # Evaluate in engine: must NOT issue BUY or STRONG BUY when fundamentals are unverified
         eval_out = platform.evaluate_institutional_engine(
             symbol="UNVERIFIEDCO",
             name="Unverified Corp Ltd",
@@ -66,6 +64,43 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         self.assertNotIn("BUY", eval_out["short_signal"])
         self.assertEqual(eval_out["decision_category"], "HOLD")
         self.assertIn("Unverified", eval_out["eps_display"])
+
+    def test_institutional_fundamentals_registry_prevents_unverified_on_render(self):
+        closes = [680.0 + (i % 7) * 2.0 for i in range(300)]
+        for sym, name, price in (
+            ("HDFCBANK", "HDFC Bank Limited", 691.20),
+            ("SYNGENE", "Syngene International Limited", 365.85),
+            ("GODREJCP", "Godrej Consumer Products Limited", 845.05),
+            ("UNITDSPR", "United Spirits Limited", 1252.10),
+            ("FINCABLES", "Finolex Cables Limited", 1094.60),
+        ):
+            fund = asyncio.run(
+                platform.fetch_real_fundamentals_online(sym, name, "IN", price, closes)
+            )
+            self.assertTrue(fund["fundamentals_verified"], f"{sym} must be verified via registry fallback")
+            self.assertIsNotNone(fund["pe"])
+            self.assertIsNotNone(fund["eps"])
+            self.assertIsNotNone(fund["roe"])
+
+            eval_out = platform.evaluate_institutional_engine(
+                symbol=sym,
+                name=name,
+                country="IN",
+                exchange="NSE",
+                currency="INR",
+                asset_type="EQUITY",
+                price=price,
+                prev_close=price * 0.99,
+                change_pct=1.0,
+                closes_3y=closes,
+                timestamps_3y=[],
+                vol_ratio=1.1,
+                real_fundamentals=fund,
+                provider_name="NSE_BSE_LIVE_API",
+            )
+            self.assertTrue(eval_out["fundamentals_verified"])
+            self.assertNotEqual(eval_out["valuation_assumptions"]["valuation_method"], "N/A")
+            self.assertNotIn("Unverified", eval_out["short_signal"])
 
     def test_negative_or_zero_earnings_invalidates_positive_pe(self):
         closes = [200.0 - i * 0.3 for i in range(260)]
@@ -121,7 +156,6 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
 
     def test_price_eps_pe_discrepancy_detected_and_corrected(self):
         closes = [900.0 + i * 0.4 for i in range(260)]
-        # Live price = 1000, EPS = 50 -> True P/E = 20.0x, but provider reports stale P/E = 32.0x
         res = platform.validate_and_reconcile_fundamentals(
             symbol="TATASTEEL",
             company_name="Tata Steel Ltd",
@@ -150,8 +184,8 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
                 "pe": 20.0,
                 "roic": 16.0,
                 "shares_outstanding": 100.0,
-                "market_cap": 75000.0,  # Should be 500 * 100 = 50000.0
-                "dividend_yield": 42.0,  # Impossible >25% yield
+                "market_cap": 75000.0,
+                "dividend_yield": 42.0,
             },
             source_tag="SCREENER_LIVE",
         )
@@ -195,7 +229,6 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         )
         self.assertTrue(bank_eval["safe_buy_limit"] < bank_eval["fair_value"] < bank_eval["sell_trigger_limit"])
 
-        # Value Trap Test: Low P/E (7.5x) but sub-WACC ROIC (4.5%) and high Debt/Equity (2.1x)
         declining_closes = [300.0 - i * 0.4 for i in range(300)]
         trap_fund = platform.validate_and_reconcile_fundamentals(
             symbol="TRAPCO",
@@ -227,7 +260,6 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         self.assertIn("TRAP", trap_eval["short_signal"])
 
     def test_high_quality_compounder_at_expensive_price_is_not_confused_with_buy(self):
-        # High ROIC (28%) > WACC, but trading at P/E 48x well above Fair Value
         closes = [1000.0 + i * 2.5 for i in range(300)]
         expensive_fund = platform.validate_and_reconcile_fundamentals(
             symbol="EXPENSIVECOMP",
@@ -254,13 +286,10 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
             real_fundamentals=expensive_fund,
             provider_name="NSE_BSE_LIVE_API",
         )
-        # Must NOT be BUY when price is far above fair value
         self.assertLess(eval_out["mos_pct"], 0.0)
         self.assertIn(eval_out["decision_category"], ("HOLD", "SELL"))
 
     def test_hdfcbank_screenshot_fair_value_and_swing_rsi_consistency(self):
-        # Exact inputs from live HDFCBANK screenshot:
-        # Live Price = 695.25, P/E = 13.4, EPS = 51.88, ROE = 13.6%, Book Value = 391.0, 3Y ago = 753.03
         closes = [753.03 + (i % 9 - 4) * 3.5 for i in range(500)] + [788.93 - i * 0.45 for i in range(195)] + [690.0, 692.0, 694.0, 693.5, 695.25]
         fund = platform.validate_and_reconcile_fundamentals(
             symbol="HDFCBANK",
@@ -287,20 +316,15 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
             real_fundamentals=fund,
             provider_name="NSE_BSE_LIVE_API",
         )
-        # 1. Stage-1 growth must be positive Sustainable Growth Rate (~10.6%), never negative (-1.76%) from 3Y price drop
         self.assertGreater(out["valuation_assumptions"]["assumed_stage1_growth_pct"], 8.0)
-        # 2. Fair Value must reflect 1.9x-2.1x Book Value and 17x-19x EPS (~₹830-₹880), well above ₹695.25
         self.assertGreater(out["fair_value"], 800.0)
         self.assertGreater(out["mos_pct"], 12.0)
         self.assertEqual(out["decision_category"], "BUY")
         self.assertIn("BUY", out["short_signal"])
-        # 3. Swing setup must NEVER claim 'Overbought RSI >= 74' when RSI(14) < 74
         self.assertLess(out["rsi_14"], 74.0)
         self.assertNotIn("Overbought RSI", out["sw_setup"])
 
     def test_closed_loop_gemini_verifier_corrects_wrong_buy_sell_and_fair_value(self):
-        # 1. Simulate the exact buggy HDFCBANK payload from the screenshot:
-        # Depressed Fair Value ₹495.63, false 'SELL / BOOK PROFIT', and false 'Overbought RSI >= 74' with RSI=41.9
         buggy_hdfc_payload = {
             "symbol": "HDFCBANK",
             "name": "HDFC Bank Limited",
@@ -353,8 +377,6 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         self.assertIn("VALUATION_UNDERESTIMATE_AUTO_CORRECTED", codes)
         self.assertIn("SWING_RSI_LABEL_CONTRADICTION_FIXED", codes)
 
-        # 2. Simulate a false BUY signal on an overvalued stock (Price ₹1,500 vs Fair Value ₹950)
-        # and a false Swing BUY when RSI(14) = 78.5 (overbought)
         false_buy_payload = {
             "symbol": "OVERVALUEDCO",
             "name": "Overvalued Corp",
@@ -407,49 +429,39 @@ class TestTechnicalIndicatorsAndZeroLookaheadBacktest(unittest.TestCase):
     """Tests Section 6 & 12: Split adjuster, Wilder RSI, True ATR(14), and Zero-Lookahead Backtesting."""
 
     def test_split_adjuster_preserves_genuine_crash_and_adjusts_exact_split(self):
-        # 2:1 split from 1000 to 500 should scale prior history by 0.5
         split_series = [1000.0, 1010.0, 1020.0, 510.0, 515.0, 520.0]
         adj = platform.clean_and_split_adjust_series(split_series, 520.0)
         self.assertAlmostEqual(adj[0], 500.0, places=1)
         self.assertAlmostEqual(adj[2], 510.0, places=1)
 
-        # Genuine 38% earnings crash (1000 -> 620 -> 615) must NOT be erased as a corporate split
         crash_series = [1000.0, 1005.0, 1000.0, 620.0, 615.0, 610.0]
         adj_crash = platform.clean_and_split_adjust_series(crash_series, 610.0)
         self.assertAlmostEqual(adj_crash[2], 1000.0, places=1)
         self.assertAlmostEqual(adj_crash[3], 620.0, places=1)
 
-        # Single-day bad tick spike (500 -> 820 -> 502) should be repaired
         glitch_series = [500.0, 501.0, 820.0, 502.0, 503.0]
         adj_glitch = platform.clean_and_split_adjust_series(glitch_series, 503.0)
         self.assertAlmostEqual(adj_glitch[2], 501.5, places=1)
 
     def test_wilder_rsi_and_true_ohlc_atr_edge_cases(self):
-        # Flat series -> RSI = 50.0
         flat = [100.0] * 30
         self.assertEqual(platform.compute_wilder_rsi_series(flat, 14)[-1], 50.0)
-        # Monotonically rising -> RSI = 100.0
         rising = [100.0 + i for i in range(30)]
         self.assertEqual(platform.compute_wilder_rsi_series(rising, 14)[-1], 100.0)
-        # Monotonically falling -> RSI = 0.0
         falling = [200.0 - i for i in range(30)]
         self.assertEqual(platform.compute_wilder_rsi_series(falling, 14)[-1], 0.0)
 
-        # True OHLC ATR should reflect High-Low range even if closes are flat
         highs = [105.0] * 30
         lows = [95.0] * 30
         atr_ohlc = platform.compute_atr_14(flat, 100.0, highs=highs, lows=lows)
         self.assertAlmostEqual(atr_ohlc, 10.0, places=1)
 
     def test_zero_lookahead_backtest_invariance_and_friction_costs(self):
-        # Generate 350 bars of cyclical trend data
         closes = [
             round(200.0 + 25.0 * math.sin(i / 14.0) + (i * 0.25), 2)
             for i in range(350)
         ]
         bt_1 = platform.run_daily_frame_signal_audit(closes[:260], [], False, "₹")
-
-        # Mutate future bars [260..350] drastically and verify signals generated before bar (260 - 44) are identical
         closes_mutated = closes[:260] + [9999.0] * 90
         bt_2 = platform.run_daily_frame_signal_audit(closes_mutated[:260], [], False, "₹")
         self.assertEqual(bt_1["signal_log"], bt_2["signal_log"])
@@ -466,22 +478,15 @@ class TestPortfolioAccountingAndGSheetSync(unittest.TestCase):
         txs = [
             {"date": "2026-01-10", "type": "BUY", "symbol": "INFY", "quantity": 10, "price": 1400.0, "fees": 20.0},
             {"date": "2026-02-15", "type": "BUY", "symbol": "INFY", "quantity": 10, "price": 1600.0, "fees": 20.0},
-            # Duplicate of row 2 with same fingerprint -> must be skipped
             {"date": "2026-02-15", "type": "BUY", "symbol": "INFY", "quantity": 10, "price": 1600.0, "fees": 20.0, "row_id": 1},
-            # Partial sell of 5 shares at 1800 with 10 fee
             {"date": "2026-03-20", "type": "SELL", "symbol": "INFY", "quantity": 5, "price": 1800.0, "fees": 10.0},
-            # 2-for-1 stock split -> 15 shares become 30 shares, avg cost halves
             {"date": "2026-04-01", "type": "SPLIT", "symbol": "INFY", "quantity": 1, "price": 0.0, "split_ratio": 2.0},
-            # Dividend of ₹500
             {"date": "2026-05-01", "type": "DIVIDEND", "symbol": "INFY", "quantity": 500.0, "price": 1.0, "fees": 0.0},
         ]
         res = platform.calculate_portfolio_from_transactions(txs)
         self.assertEqual(res["duplicates_skipped"], 1)
         self.assertEqual(len(res["positions"]), 1)
         pos = res["positions"][0]
-        # Before split: 20 shares cost = 14000 + 20 + 16000 + 20 = 30040 -> avg cost = 1502.0
-        # Sold 5 shares @ 1800 - 10 fee = 8990 net proceeds; cost removed = 5 * 1502 = 7510 -> realized P&L = +1480.0
-        # Remaining 15 shares split 2:1 -> 30 shares, total cost = 22530 -> new avg cost = 751.0
         self.assertEqual(pos["quantity"], 30.0)
         self.assertAlmostEqual(pos["avg_buy_price"], 751.0, places=2)
         self.assertAlmostEqual(pos["realized_pnl"], 1480.0, places=2)
@@ -501,14 +506,13 @@ class TestPortfolioAccountingAndGSheetSync(unittest.TestCase):
         )
         positions, has_cost = platform.parse_gsheet_instruments_csv(instruments_csv)
         self.assertTrue(has_cost)
-        self.assertEqual(len(positions), 4)  # ICICIBANK with Qty='-' is excluded, not polluting watchlist
+        self.assertEqual(len(positions), 4)
         by_sym = {p["symbol"]: p for p in positions}
         self.assertEqual(by_sym["NIFTYBEES"]["quantity"], 117.0)
         self.assertEqual(by_sym["NIFTYBEES"]["avg_buy_price"], 263.89)
         self.assertEqual(by_sym["COALINDIA"]["quantity"], 20.0)
         self.assertEqual(by_sym["HDFCBANK"]["avg_buy_price"], 712.40)
 
-        # Also test Transactions CSV parsing from Portfolio_Tracker Rahil
         tx_csv = (
             "Transactions (yahan apni har BUY / SELL entry karo),,,,,,,\n"
             "Date,Type (BUY/SELL),Symbol,Qty,Price per unit (₹),Fees (₹) optional,Amount (₹)\n"
@@ -531,7 +535,7 @@ class TestPortfolioAccountingAndGSheetSync(unittest.TestCase):
 
 
 class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
-    """Tests API endpoints, health check, SSRF guard, secret masking, and portfolio cost-basis integrity."""
+    """Tests API endpoints, Stock AI Chatbox & live override, BUY-only Top 15, and UI cleanliness."""
 
     @classmethod
     def setUpClass(cls):
@@ -553,13 +557,97 @@ class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
         self.assertEqual(a_data["buy_fair_sell_ordering_errors"], 0)
         self.assertEqual(a_data["swing_stop_target_errors"], 0)
 
-    def test_frontend_html_does_not_leak_secrets(self):
+    def test_frontend_html_removes_backtest_and_stress_test_and_includes_stock_chatbox(self):
         r_home = self.client.get("/")
         self.assertEqual(r_home.status_code, 200)
         html = r_home.text
-        # Must NOT contain the old hardcoded Dhan API secret or raw JWT token
+        # Must NOT contain hardcoded secrets
         self.assertNotIn("f0200da2-cba1-419c-a955-0d7671783ff7", html)
         self.assertNotIn("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9", html)
+        # Must NOT contain Backtest Win Rate, Sahi/Galat table, or 10,500 Stress-Test window in UI
+        self.assertNotIn("Zero-Lookahead BUY &amp; SELL Backtest Log", html)
+        self.assertNotIn("Sahi:", html)
+        self.assertNotIn("Galat:", html)
+        self.assertNotIn("openAudit10500Modal", html)
+        self.assertNotIn("audit10500Modal", html)
+        # MUST contain the interactive Stock AI Chatbot and Top 15 BUY Signals UI
+        self.assertIn("Interactive Stock AI Chatbot", html)
+        self.assertIn("sendStockChatMessage", html)
+        self.assertIn("Top 15 Verified BUY Signal Picks", html)
+
+    def test_stock_ai_chatbot_answers_questions_and_applies_live_overrides(self):
+        # Seed HDFCBANK into SYMBOL_CACHE so offline test environment doesn't need external Yahoo network
+        closes = [700.0 + (i % 5) * 2.0 for i in range(300)]
+        fund = platform.validate_and_reconcile_fundamentals(
+            symbol="HDFCBANK",
+            company_name="HDFC Bank Limited",
+            country="IN",
+            live_price=691.20,
+            closes_3y=closes,
+            raw_metrics=platform.INSTITUTIONAL_FUNDAMENTALS_REGISTRY["HDFCBANK"],
+            source_tag="VERIFIED_FILINGS_REGISTRY",
+        )
+        seeded = platform.evaluate_institutional_engine(
+            symbol="HDFCBANK",
+            name="HDFC Bank Limited",
+            country="IN",
+            exchange="NSE",
+            currency="INR",
+            asset_type="EQUITY",
+            price=691.20,
+            prev_close=694.0,
+            change_pct=-0.41,
+            closes_3y=closes,
+            timestamps_3y=[],
+            vol_ratio=1.0,
+            real_fundamentals=fund,
+            provider_name="NSE_BSE_LIVE_API",
+        )
+        platform.SYMBOL_CACHE.set("HDFCBANK", seeded)
+
+        # 1. Ask a question about Fair Value calculation
+        r_q = self.client.post(
+            "/api/v1/stock/HDFCBANK/chat",
+            json={"message": "How is the Fair Value of HDFCBANK calculated?", "exchange": "NSE"},
+        )
+        self.assertEqual(r_q.status_code, 200)
+        q_data = r_q.json()
+        self.assertIn("Fair Value", q_data["reply"])
+        self.assertEqual(q_data["corrections_applied"], {})
+
+        # 2. Override Fair Value and Signal via natural language command in the chatbox
+        def _mock_search(symbol: str = "HDFCBANK", exchange: str = "AUTO"):
+            # Re-evaluate with USER_STOCK_OVERRIDES applied
+            f_upd = asyncio.run(platform.fetch_real_fundamentals_online("HDFCBANK", "HDFC Bank Limited", "IN", 691.20, closes))
+            ev_upd = platform.evaluate_institutional_engine(
+                symbol="HDFCBANK",
+                name="HDFC Bank Limited",
+                country="IN",
+                exchange="NSE",
+                currency="INR",
+                asset_type="EQUITY",
+                price=691.20,
+                prev_close=694.0,
+                change_pct=-0.41,
+                closes_3y=closes,
+                timestamps_3y=[],
+                vol_ratio=1.0,
+                real_fundamentals=f_upd,
+                provider_name="NSE_BSE_LIVE_API",
+            )
+            platform.SYMBOL_CACHE.set("HDFCBANK", ev_upd)
+            return ev_upd
+
+        parsed_ovr = platform.parse_user_chat_corrections("Set fair value to 910 and pe to 14.5")
+        self.assertEqual(parsed_ovr["fair_value"], 910.0)
+        self.assertEqual(parsed_ovr["pe"], 14.5)
+
+        platform.USER_STOCK_OVERRIDES["HDFCBANK"] = parsed_ovr
+        updated_stock = _mock_search()
+        self.assertEqual(updated_stock["fair_value"], 910.0)
+        self.assertEqual(updated_stock["decision_category"], "BUY")
+        self.assertEqual(updated_stock["short_signal"], "STRONG BUY")
+        platform.USER_STOCK_OVERRIDES.clear()
 
     def test_ssrf_protection_on_broker_connect(self):
         r_bad = self.client.post(
@@ -569,7 +657,6 @@ class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
         self.assertEqual(r_bad.status_code, 400)
 
     def test_portfolio_missing_cost_basis_not_confused_with_live_price(self):
-        # Adding a holding without avg_buy_price must store avg_buy_price=None (has_cost_basis=False)
         r_add = self.client.post(
             "/api/v1/portfolio",
             json={"symbol": "RELIANCE", "exchange": "NSE", "quantity": 12, "avg_buy_price": 0},
@@ -578,8 +665,6 @@ class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
         out = r_add.json()
         self.assertFalse(out["has_cost_basis"])
         self.assertIsNone(out["avg_buy_price"])
-
-        # Clean up
         self.client.delete("/api/v1/portfolio/RELIANCE")
 
     def test_watchlist_and_transaction_ledger_endpoints(self):
@@ -590,7 +675,6 @@ class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
         self.assertEqual(r_wl.status_code, 200)
         self.assertEqual(r_wl.json()["symbol"], "TCS")
 
-        # Invalid symbol injection rejected with 422
         r_bad_sym = self.client.post(
             "/api/v1/watchlist",
             json={"symbol": "<script>alert(1)</script>", "exchange": "NSE"},
@@ -623,7 +707,6 @@ class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
         self.assertEqual(len(cache), 10)
         self.assertIsNone(cache.get("K0", now_ts=101.0))
         self.assertEqual(cache.get("K14", now_ts=101.0), 14)
-        # Expired after TTL
         self.assertIsNone(cache.get("K14", now_ts=106.0))
 
 
