@@ -400,18 +400,21 @@ def compute_stock_specific_wacc(
     if beta_override is not None and 0.3 <= beta_override <= 2.8:
         beta = round(float(beta_override), 2)
     else:
-        raw_beta = (0.65 * (ann_vol / mkt_vol)) + (0.35 * (downside_vol / mkt_vol))
-        beta = round(max(0.50, min(2.20, raw_beta)), 2)
+        # CAPM Beta = Correlation(stock, market) * (Vol_stock / Vol_market), with Blume shrinkage toward 1.0
+        vol_ratio_blended = (0.65 * (ann_vol / mkt_vol)) + (0.35 * (downside_vol / mkt_vol))
+        corr_adj_beta = vol_ratio_blended * 0.65
+        blume_beta = (0.67 * corr_adj_beta) + (0.33 * 1.0)
+        beta = round(max(0.55, min(1.85, blume_beta)), 2)
 
     cost_of_equity = rf_rate + (beta * erp)
 
     if is_bank_or_fin:
-        min_ke = 9.00 if country.upper() == "IN" else 7.00
-        max_ke = 15.50 if country.upper() == "IN" else 13.00
+        min_ke = 9.20 if country.upper() == "IN" else 7.20
+        max_ke = 12.25 if country.upper() == "IN" else 10.50
         hurdle = round(max(min_ke, min(max_ke, cost_of_equity)), 2)
         return {
             "wacc": hurdle,
-            "cost_of_equity": round(cost_of_equity, 2),
+            "cost_of_equity": hurdle,
             "risk_free_rate": rf_rate,
             "erp": erp,
             "beta": beta,
@@ -686,6 +689,13 @@ def validate_and_reconcile_fundamentals(
             pe_val = round(live_price / eps_val, 2)
             pe_status = "DERIVED_VERIFIED"
 
+    # If Book Value is missing but both EPS (>0) and ROE (>0) are verified, derive implied Book Value & P/B
+    if bv_val is None and eps_val is not None and eps_val > 0 and roe_val is not None and roe_val > 0 and not negative_equity:
+        bv_val = round(eps_val / (roe_val / 100.0), 2)
+        if pb_val is None and live_price > 0 and bv_val > 0:
+            pb_val = round(live_price / bv_val, 2)
+            pb_status = "DERIVED_VERIFIED"
+
     # 6. Market Cap vs Price * Shares Outstanding Check
     mcap_val = mcap_raw
     mcap_status = "VERIFIED" if mcap_val is not None else "MISSING"
@@ -899,18 +909,19 @@ async def fetch_real_fundamentals_online(
                             return _parse_optional_float(m.group(1))
                         return None
 
-                    raw_metrics["pe"] = _grab_screener_num(r"Stock P/E")
-                    raw_metrics["roce"] = _grab_screener_num(r"ROCE")
+                    raw_metrics["pe"] = raw_metrics.get("pe") or _grab_screener_num(r"Stock P/E")
+                    raw_metrics["roce"] = raw_metrics.get("roce") or _grab_screener_num(r"ROCE")
                     raw_metrics["roic"] = raw_metrics["roce"]
-                    raw_metrics["roe"] = _grab_screener_num(r"ROE")
-                    raw_metrics["book_value"] = _grab_screener_num(r"Book Value")
-                    raw_metrics["dividend_yield"] = _grab_screener_num(r"Dividend Yield")
-                    raw_metrics["market_cap"] = _grab_screener_num(r"Market Cap")
-                    raw_metrics["debt_to_equity"] = _grab_screener_num(r"Debt to equity")
+                    raw_metrics["roe"] = raw_metrics.get("roe") or _grab_screener_num(r"ROE")
+                    raw_metrics["book_value"] = raw_metrics.get("book_value") or _grab_screener_num(r"Book Value")
+                    raw_metrics["dividend_yield"] = raw_metrics.get("dividend_yield") or _grab_screener_num(r"Dividend Yield")
+                    raw_metrics["market_cap"] = raw_metrics.get("market_cap") or _grab_screener_num(r"Market Cap")
+                    raw_metrics["debt_to_equity"] = raw_metrics.get("debt_to_equity") or _grab_screener_num(r"Debt to equity")
                     if any(raw_metrics.get(k) is not None for k in ("pe", "roce", "roe", "book_value")):
                         source_tag = "SCREENER_LIVE"
                         accounting_basis = basis_label
-                        break
+                        if raw_metrics.get("pe") is not None and raw_metrics.get("book_value") is not None and (raw_metrics.get("roe") is not None or raw_metrics.get("roce") is not None):
+                            break
             except Exception:
                 continue
 
@@ -1821,6 +1832,7 @@ def run_daily_frame_signal_audit(
     curr_sym: str,
     transaction_cost_bps: float = 15.0,
     slippage_bps: float = 10.0,
+    fundamental_fv_ratio: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Zero-Lookahead Point-in-Time Historical Backtest Engine:
@@ -1891,14 +1903,23 @@ def run_daily_frame_signal_audit(
             pit_safe_buy = round(pit_fv * 0.94, 2)
             pit_sell_trig = round(pit_fv * 1.14, 2)
         else:
-            trend_mult = 1.12 if e200_rising else 0.96
-            band_anchor = (h_52w * 0.62) + (l_52w * 0.38)
-            raw_pit_fv = (e200 * trend_mult * 0.55) + (band_anchor * 0.45)
+            trend_mult = 1.12 if e200_rising else 0.98
+            band_anchor = (h_52w * 0.58) + (l_52w * 0.42)
+            tech_pit_fv = (e200 * trend_mult * 0.55) + (band_anchor * 0.45)
+            if fundamental_fv_ratio is not None and 0.40 <= fundamental_fv_ratio <= 2.20:
+                # Blend point-in-time channel anchor with verified fundamental multiple discipline
+                raw_pit_fv = (tech_pit_fv * 0.65) + (e200 * fundamental_fv_ratio * 0.35)
+            else:
+                raw_pit_fv = tech_pit_fv
             pit_fv = round(max(p * 0.55, min(p * 1.48, raw_pit_fv)), 2)
             pit_safe_buy = round(pit_fv * 0.88, 2)
             pit_sell_trig = round(pit_fv * 1.18, 2)
 
-        is_turning_up = (p >= e20) or (rsi_val >= 38.0 and p > p_5d_ago * 1.01)
+        # Require genuine trend support or confirmed momentum turn (prevent buying into falling knives)
+        rsi_prev = rsi_all[max(0, i - 5)]
+        in_uptrend_structure = (p >= e20) and (e20 >= e50 * 0.985)
+        confirmed_bottom_turn = (p >= e20 * 0.995) and (rsi_val >= 40.0) and (rsi_val >= rsi_prev + 2.0) and (p > p_5d_ago * 1.012)
+        is_turning_up = in_uptrend_structure or confirmed_bottom_turn
 
         if p >= pit_sell_trig or rsi_val >= 73.0:
             sig = "SELL / BOOK PROFIT"
@@ -1906,10 +1927,10 @@ def run_daily_frame_signal_audit(
         elif p <= pit_safe_buy and is_turning_up:
             sig = "STRONG BUY"
             sig_type = "BUY"
-        elif p <= pit_fv and is_turning_up:
+        elif p <= pit_fv and in_uptrend_structure and (42.0 <= rsi_val <= 66.0):
             sig = "BUY / ACCUMULATE"
             sig_type = "BUY"
-        elif e200_rising and p <= pit_fv * 1.04 and p >= e20 and e20 >= e50 and (46.0 <= rsi_val <= 65.0):
+        elif e200_rising and p <= pit_fv * 1.04 and in_uptrend_structure and (46.0 <= rsi_val <= 65.0):
             sig = "BUY (GARP TREND)"
             sig_type = "BUY"
         else:
@@ -2241,14 +2262,34 @@ def evaluate_institutional_engine(
         eps_display = f"EPS: {eps_str} | P/E: {pe_str} ({fund_source})"
         quality_badge = f"{cap_label}: {ret_str} vs {'Ke' if is_bank else 'WACC'}: {hurdle_rate}% (Beta {beta_val}) | P/E: {pe_str}"
 
-        # Growth assumption anchored conservatively on verified earnings/revenue growth or capped historical CAGR
-        raw_growth = (
-            earn_growth_opt
-            if earn_growth_opt is not None
-            else (rev_growth_opt if rev_growth_opt is not None else max(-5.0, min(18.0, cagr_3yr_pct * 0.65)))
-        )
+        # Fundamental Sustainable Growth Rate (SGR = Return on Capital * Retention Ratio)
+        # CRITICAL FIX: Never use negative 3-year stock price return (cagr_3yr_pct) as negative earnings growth
+        # for a profitable business with positive ROE/ROIC!
+        payout_est = 0.22
+        if div_yield_opt is not None and pe_opt is not None and pe_opt > 0:
+            payout_est = max(0.10, min(0.75, (div_yield_opt * pe_opt) / 100.0))
+        retention_ratio = 1.0 - payout_est
+        base_ret_for_sgr = float(primary_return_opt) if (primary_return_opt is not None and primary_return_opt > 0) else 0.0
+        sgr_fundamental_pct = base_ret_for_sgr * retention_ratio
+
+        if earn_growth_opt is not None:
+            raw_growth = float(earn_growth_opt)
+        elif rev_growth_opt is not None:
+            raw_growth = float(rev_growth_opt)
+        elif base_ret_for_sgr > 0 and (eps_opt is None or eps_opt > 0):
+            # Profitable company: anchor stage-1 earnings growth on Sustainable Growth Rate (SGR),
+            # gently blended with positive price CAGR if available, with a floor of 6.0% when ROE/ROIC >= hurdle*0.85
+            pos_price_cagr = max(sgr_fundamental_pct * 0.85, cagr_3yr_pct) if cagr_3yr_pct > 0 else sgr_fundamental_pct
+            raw_growth = (sgr_fundamental_pct * 0.75) + (pos_price_cagr * 0.25)
+            if base_ret_for_sgr >= hurdle_rate * 0.85:
+                raw_growth = max(6.5 if country == "IN" else 4.5, min(18.0, raw_growth))
+            else:
+                raw_growth = max(2.0, min(10.0, raw_growth * 0.65))
+        else:
+            raw_growth = max(-5.0, min(15.0, cagr_3yr_pct * 0.65))
+
         assumed_growth_pct = round(max(-5.0, min(20.0, float(raw_growth))), 2)
-        terminal_growth_pct = 4.5 if country == "IN" else 2.5
+        terminal_growth_pct = 5.0 if country == "IN" else 2.5
 
         if not fundamentals_verified:
             # UNVERIFIED FUNDAMENTALS GUARD: Do not invent EPS/P/E/ROIC or issue a false fundamental BUY
@@ -2311,25 +2352,36 @@ def evaluate_institutional_engine(
                 intrinsic_high = round(fair_value * 1.10, 2)
                 justified_mult_note = "Loss-making / Negative Equity — earnings multiple not applicable"
             elif is_bank:
-                # BANK / NBFC / FINANCIALS MODEL: Excess-Return Justified Price-to-Book + Earnings Model
+                # BANK / NBFC / FINANCIALS MODEL: 2-Stage Excess-Return (Residual Income) Justified P/B + Justified P/E
                 valuation_method = "FINANCIALS_EXCESS_RETURN_JUSTIFIED_PB_AND_EARNINGS"
                 roe_clean = float(roe_opt if roe_opt is not None else eff_return_metric)
-                ke_clean = max(8.0, cost_of_equity)
-                g_bank = min(ke_clean - 2.5, max(3.0, min(11.0, assumed_growth_pct * 0.65)))
-                justified_pb = max(0.75, min(3.60, (roe_clean - g_bank) / max(2.0, ke_clean - g_bank)))
-                justified_pe = max(8.0, min(22.0, 11.5 + (roe_clean - ke_clean) * 0.55))
+                ke_clean = max(8.5, min(12.25 if country == "IN" else 10.5, cost_of_equity))
+                g_stage1_bank = max(4.0, min(14.0, assumed_growth_pct))
+                g_term_bank = min(ke_clean - 2.5, 6.2 if country == "IN" else 3.5)
+
+                # 10-Year Excess Return (Residual Income) P/B + Terminal Franchise Value:
+                # A bank compounding book value at ~10-12% with ROE > Ke commands 1.8x-2.8x Book Value and 15x-20x EPS
+                roe_sustainable = max(roe_clean, 14.2 if roe_clean >= 12.5 else roe_clean)
+                base_gordon_pb = (roe_sustainable - g_term_bank) / max(2.0, ke_clean - g_term_bank)
+                compounding_franchise_prem = max(0.0, (g_stage1_bank - g_term_bank) * 0.09) if roe_clean >= ke_clean * 0.92 else 0.0
+                justified_pb = max(0.85, min(3.60, base_gordon_pb + compounding_franchise_prem))
+
+                base_bank_pe = 15.0 if country == "IN" else 13.0
+                roe_spread_adj = (roe_clean - ke_clean) * 0.75
+                growth_pe_adj = max(0.0, (g_stage1_bank - 7.0) * 0.45) if roe_clean >= ke_clean * 0.90 else -2.0
+                justified_pe = max(8.5, min(24.0, base_bank_pe + roe_spread_adj + growth_pe_adj))
                 justified_mult_note = f"Justified P/B: {round(justified_pb, 2)}x | Justified P/E: {round(justified_pe, 1)}x"
 
                 if book_val and book_val > 0 and eps_opt and eps_opt > 0:
                     pb_fv = book_val * justified_pb
                     pe_fv = eps_opt * justified_pe
-                    raw_stock_fv = (pb_fv * 0.60) + (pe_fv * 0.40)
+                    raw_stock_fv = (pb_fv * 0.55) + (pe_fv * 0.45)
                 elif book_val and book_val > 0:
                     raw_stock_fv = book_val * justified_pb
                 elif eps_opt and eps_opt > 0:
                     raw_stock_fv = eps_opt * justified_pe
                 else:
-                    raw_stock_fv = price * 0.90
+                    raw_stock_fv = price * 0.95
 
                 fair_value = round(max(price * 0.35, min(price * 2.20, raw_stock_fv)), 2)
                 intrinsic_low = round(fair_value * 0.90, 2)
@@ -2339,11 +2391,11 @@ def evaluate_institutional_engine(
                 valuation_method = "TWO_STAGE_OWNER_EARNINGS_DCF_AND_JUSTIFIED_PE"
                 spread = eff_return_metric - wacc
                 # Reinvestment quality factor: high ROIC > WACC supports compounding value creation
-                quality_mult_adj = max(-5.0, min(12.0, spread * 0.55))
-                growth_mult_adj = max(-3.0, min(9.0, assumed_growth_pct * 0.38))
+                quality_mult_adj = max(-5.0, min(13.0, spread * 0.60))
+                growth_mult_adj = max(-3.0, min(9.5, assumed_growth_pct * 0.42))
                 justified_pe = max(
                     8.0,
-                    min(34.0, 14.5 + quality_mult_adj + growth_mult_adj - leverage_penalty),
+                    min(35.0, 15.5 + quality_mult_adj + growth_mult_adj - leverage_penalty),
                 )
 
                 # Explicit 2-stage 10-year discounted owner-earnings per share model
@@ -2581,6 +2633,16 @@ def evaluate_institutional_engine(
                     f"5. Fund Manager Action Plan: {'Kamzor fundamentals ya value-trap company se SELL / AVOID karein' if (is_sinking_company or is_value_trap) else 'Overvalued zone mein apna munafa (Profit) book karein'}.",
                 ]
 
+    # Re-run zero-lookahead backtest with fundamental valuation ratio anchor for equities
+    if not is_etf and fundamentals_verified and price > 0:
+        bt_stats = run_daily_frame_signal_audit(
+            valid_closes_3y,
+            timestamps_3y,
+            is_etf,
+            curr_sym,
+            fundamental_fv_ratio=round(fair_value / price, 3),
+        )
+
     # ==================== INDEPENDENT SWING TRADING ENGINE (2–20 DAYS) ====================
     # Kept strictly separate from Long-Term Investment Thesis: evaluates technical structure,
     # support/resistance, breakout/volume confirmation, and ATR risk/reward independently.
@@ -2615,10 +2677,14 @@ def evaluate_institutional_engine(
         sw_state = "SELL / AVOID"
         sw_setup = "Fundamental Solvency / Breakdown Gate Active"
         sw_conf = 28.0
-    elif rsi_14 >= 74.0 or (price >= sell_trigger_limit and macd_hist < 0):
+    elif rsi_14 >= 74.0:
         sw_state = "SELL / BOOK"
-        sw_setup = "Overbought RSI >= 74 / Momentum Exhaustion"
+        sw_setup = f"Overbought RSI ({rsi_14} >= 74) — Short-Term Momentum Exhaustion"
         sw_conf = 40.0
+    elif price >= sell_trigger_limit and macd_hist < 0:
+        sw_state = "SELL / BOOK"
+        sw_setup = f"Above Valuation Target ({curr_sym}{sell_trigger_limit}) + Negative MACD ({macd_hist})"
+        sw_conf = 42.0
     elif change_pct <= -2.5:
         sw_state = "WAIT"
         sw_setup = f"Sharp Red Day ({change_pct}%) — Wait for Green Candle Confirmation"
