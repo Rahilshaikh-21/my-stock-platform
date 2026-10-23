@@ -18,7 +18,6 @@ from pydantic import BaseModel
 
 # ============================================================================
 # 1. CONFIGURATION, CREDENTIALS & PERMANENT GOOGLE SHEET LINK
-#    (ZERO HARDCODED STOCK OR ETF NAMES IN THE ENGINE)
 # ============================================================================
 
 DEFAULT_DHAN_CLIENT_ID = "1113782932"
@@ -216,14 +215,6 @@ def compute_stock_specific_wacc(country: str, closes_3y: List[float], beta_overr
 async def fetch_real_fundamentals_online(
     symbol: str, company_name: str, country: str, live_price: float, closes_3y: List[float]
 ) -> Dict[str, Any]:
-    """
-    Fetches real Stock P/E, Book Value, ROCE %, ROE %, and derives exact TTM EPS:
-    - India: Parses Screener.in #top-ratios block + Tapetide API.
-      Critically derives `EPS = Live_Price / Stock_PE` when Screener provides Stock P/E
-      (since Screener's top-ratios box lists Stock P/E & Book Value rather than raw EPS).
-    - US: Queries Finnhub /stock/metric?metric=all.
-    - Banks/NBFCs: Uses ROE as the primary capital-efficiency metric when ROCE is artificially low due to deposits.
-    """
     clean = symbol.strip().upper()
     cache_key = f"{country.upper()}:{clean}"
     wacc_info = compute_stock_specific_wacc(country, closes_3y)
@@ -314,29 +305,19 @@ async def fetch_real_fundamentals_online(
     if beta_val:
         wacc_info = compute_stock_specific_wacc(country, closes_3y, beta_override=beta_val)
 
-    # Accounting Identity Derivations from Verified Ratios:
-    # 1. If Stock P/E is verified from Screener/Finnhub and EPS wasn't listed separately: EPS = Price / PE
     if eps_val is None and pe_val is not None and pe_val > 0:
         eps_val = round(live_price / pe_val, 2)
-    # 2. If EPS is verified via Book Value * ROE:
     if eps_val is None and book_val is not None and book_val > 0 and roe_val is not None and roe_val > 0:
         eps_val = round(book_val * (roe_val / 100.0), 2)
-    # 3. If P/E is missing but EPS is known:
     if pe_val is None and eps_val is not None and eps_val > 0:
         pe_val = round(live_price / eps_val, 2)
-    # 4. If ROE is missing but EPS and Book Value are known:
     if roe_val is None and eps_val is not None and book_val is not None and book_val > 0:
         roe_val = round((eps_val / book_val) * 100.0, 2)
-    # 5. If ROE is still missing but ROCE is known:
     if roe_val is None and roic_val is not None:
         roe_val = round(roic_val * 0.88, 2)
-    # 6. If ROCE/ROIC is missing but ROE is known:
     if roic_val is None and roe_val is not None:
         roic_val = round(roe_val * 0.92, 2)
 
-    # Bank / NBFC Adjustment:
-    # Banks use deposits as operating inventory, making raw ROCE (~6-7%) non-comparable to WACC.
-    # For Banks/NBFCs, ROE vs Cost of Equity (Ke) is the institutional standard.
     upper_ident = f"{clean} {company_name.upper()}"
     is_bank_or_fin = any(w in upper_ident for w in ("BANK", "FIN", "NBFC", "CAPITAL", "HOUSING", "INSURANCE", "CHOLA", "BAJAJ"))
     raw_roce_reported = roic_val
@@ -346,7 +327,6 @@ async def fetch_real_fundamentals_online(
             roic_val = max(roic_val or 0.0, roe_val)
         wacc_info["wacc"] = round(min(wacc_info["wacc"], 10.80 if country == "IN" else 9.00), 2)
 
-    # Quantitative fallback ONLY when external fundamental HTML/API was unreachable (e.g. network timeout)
     ann_vol_pct = wacc_info["ann_vol_pct"]
     years_span = max(0.5, len(closes_3y) / 252.0)
     cagr_3y = (((live_price / closes_3y[0]) ** (1.0 / years_span)) - 1.0) * 100.0 if (closes_3y and closes_3y[0] > 0) else 8.0
@@ -364,7 +344,9 @@ async def fetch_real_fundamentals_online(
     if eps_val is None and pe_val > 0:
         eps_val = round(live_price / pe_val, 2)
 
-    fundamentals_verified = source_tag in ("SCREENER_LIVE", "TAPETIDE_LIVE", "FINNHUB_LIVE") and (pe_val is not None or roe_val is not None or roic_val is not None)
+    fundamentals_verified = source_tag in ("SCREENER_LIVE", "TAPETIDE_LIVE", "FINNHUB_LIVE") and (
+        pe_val is not None or roe_val is not None or roic_val is not None
+    )
 
     out = {
         "pe": round(pe_val, 2),
@@ -434,13 +416,6 @@ async def sync_dhan_live_holdings_into_portfolio() -> int:
 
 
 async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Robust Google Sheet Portfolio & 12-Hour Token Syncer:
-    - Handles both standard CSV exports (where headers are on row 4) AND Google Visualization
-      `gviz` CSV exports (where top rows are merged into `"Instruments ... TOTAL Symbol"`).
-    - Imports active holdings (`Qty held > 0`) and exact `Avg buy cost (₹)` from `Instruments`,
-      or reconstructs weighted-average cost from `Transactions` if `Instruments` is unavailable.
-    """
     target_url = (sheet_url or BROKER_RUNTIME_CONFIG.get("portfolio_gsheet_url") or DEFAULT_PORTFOLIO_GSHEET_URL).strip()
     if not target_url:
         return {"token_updated": False, "positions_imported": 0, "watchlist_imported": 0, "source": "none"}
@@ -471,7 +446,6 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
     def find_instruments_columns(rows: List[List[str]]):
         for ri, row in enumerate(rows[:20]):
             heads = [norm(c) for c in row]
-            # Match either exact "symbol" OR gviz merged header ending with " symbol"
             sym_i = next((i for i, h in enumerate(heads) if h == "symbol" or h.endswith(" symbol")), -1)
             qty_i = next(
                 (i for i, h in enumerate(heads) if "qty held" in h or "quantity held" in h or h == "qty" or h.endswith(" qty")),
@@ -497,7 +471,6 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
                 continue
             text_body = resp.text
 
-            # 1. Scan every sheet tab for a renewed 12-hour Dhan JWT token
             jwt_matches = JWT_TOKEN_PATTERN.findall(text_body)
             if jwt_matches:
                 latest_jwt = jwt_matches[-1].strip()
@@ -554,7 +527,6 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
         except Exception:
             continue
 
-    # Fallback: Reconstruct holdings from Transactions tab if Instruments wasn't imported
     if instruments_imported == 0 and transactions_text:
         try:
             rows = list(csv.reader(io.StringIO(transactions_text)))
@@ -817,13 +789,6 @@ def run_daily_frame_signal_audit(
     is_etf: bool,
     curr_sym: str,
 ) -> Dict[str, Any]:
-    """
-    ZERO-LOOKAHEAD DAILY-FRAME BACKTEST ENGINE (v22.0):
-    1. Evaluates each historical bar `i` using ONLY prices and indicators known up to bar `i`
-       (never leaks future EPS, future ROIC, or future prices into bar `i`).
-    2. Grades actionable BUY and SELL signals against completed 30-day (21 trading bars)
-       and 60-day (43 trading bars) forward outcomes.
-    """
     n = len(closes)
     if n < 35:
         return {
@@ -871,7 +836,6 @@ def run_daily_frame_signal_audit(
             pit_safe_buy = round(pit_fv * 0.94, 2)
             pit_sell_trig = round(pit_fv * 1.14, 2)
         else:
-            # Point-in-time structural & mean-reversion value anchor (zero look-ahead)
             trend_mult = 1.12 if e200_rising else 0.96
             band_anchor = (h_52w * 0.62) + (l_52w * 0.38)
             raw_pit_fv = (e200 * trend_mult * 0.55) + (band_anchor * 0.45)
@@ -1052,9 +1016,6 @@ def evaluate_institutional_engine(
 
     bt_stats = run_daily_frame_signal_audit(closes_3y, timestamps_3y, is_etf, curr_sym)
 
-    # ========================================================================
-    # BRANCH A: DEDICATED ETF VALUATION & DECISION ENGINE
-    # ========================================================================
     if is_etf:
         nav_trend_anchor = ema_200 * (1.05 if is_200ema_rising else 1.01)
         channel_midpoint = (high_52w * 0.55) + (low_52w * 0.45)
@@ -1097,17 +1058,13 @@ def evaluate_institutional_engine(
             f"5. Zero-Lookahead Backtest Proof: Pichle 3 saal mein is ETF par {bt_stats['signals_count']} actionable signals aaye jinmein se {bt_stats['correct_count']} SAHI aur {bt_stats['wrong_count']} GALAT ({bt_stats['win_rate_pct']}% Accuracy) rahe.",
         ]
 
-    # ========================================================================
-    # BRANCH B: EQUITY STOCK FUND-MANAGER ENGINE (VALUE + GARP + BANK ROE)
-    # ========================================================================
     else:
         is_fundamentally_strong = (eps > 0) and (eff_roic >= wacc * 0.90)
-         justified_pe = min(28.0, max(12.0, 15.0 + max(-4.0, (eff_roic - wacc) * 0.65) + max(0.0, min(10.0, cagr_3yr_pct * 0.20))))
+        justified_pe = min(28.0, max(12.0, 15.0 + max(-4.0, (eff_roic - wacc) * 0.65) + max(0.0, min(10.0, cagr_3yr_pct * 0.20))))
         structural_anchor = (high_52w * 0.60) + (ema_200 * 0.40)
 
         if eps > 0:
             earnings_fv = eps * justified_pe
-            # For Banks with Book Value, also blend Excess-Return Justified P/B
             if is_bank and book_val and book_val > 0:
                 justified_pb = max(1.1, min(3.2, (eff_roe / max(8.0, wacc)) * 1.45))
                 pb_fv = book_val * justified_pb
@@ -1129,7 +1086,6 @@ def evaluate_institutional_engine(
         cap_label = "ROE (Bank)" if is_bank else "ROIC"
         quality_badge = f"{cap_label}: {eff_roic}% vs WACC: {wacc}% (Beta {beta_val}) | P/E: {implied_pe}x"
 
-        # True Sinking Business ("Doobti Company"): ONLY when EPS <= 0 OR ROIC < 0.75 * WACC with 3Y negative trend!
         is_sinking_company = (
             (eps <= 0)
             or (eff_roic < wacc * 0.75 and cagr_3yr_pct <= -8.0 and price < ema_200)
@@ -1202,9 +1158,6 @@ def evaluate_institutional_engine(
                 f"5. Fund Manager Action Plan: {'Kamzor fundamentals wali company se SELL / EXIT karein' if is_sinking_company else 'Overvalued zone mein apna munafa (Profit) book karein'}.",
             ]
 
-    # ========================================================================
-    # STEP 4: 4-FACTOR SWING TRADING ENGINE (2-20 DAYS)
-    # ========================================================================
     sw_stop = round(min(price * 0.985, price - (1.5 * atr_14)), 2)
     sw_stop = max(0.01, sw_stop)
     sw_risk = max(0.01, price - sw_stop)
@@ -1724,7 +1677,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Institutional Fund Manager, Verified Fundamentals & Portfolio Sync AI",
-    version="22.0.0-audited-production",
+    version="22.1.0-clean-deploy",
     lifespan=lifespan,
 )
 
@@ -2060,7 +2013,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         <div>
           <div class="flex items-center gap-2">
             <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">Institutional Fund Manager &amp; Actionable Backtest AI</h1>
-            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v22.0 Audited Production</span>
+            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">v22.1 Clean Deploy</span>
           </div>
           <p class="text-xs text-slate-400">High ROIC/ROE + Below Fair Value = BUY • Fair Value + Growing = BUY/HOLD • Overvalued / Broken Fundamentals = SELL</p>
         </div>
