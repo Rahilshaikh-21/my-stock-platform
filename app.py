@@ -89,6 +89,7 @@ DHAN_SECURITY_MAP: Dict[str, Dict[str, str]] = {}
 UNIVERSE_CACHE: Dict[str, Dict[str, Any]] = {}
 SYMBOL_CACHE: Dict[str, Dict[str, Any]] = {}
 FUNDAMENTALS_CACHE: Dict[str, Dict[str, Any]] = {}
+FUNDAMENTALS_CACHE_TTL_SECONDS = 6 * 60 * 60
 CACHE_TTL_SECONDS = 900.0
 
 WATCHLIST_STORE: List[Dict[str, Any]] = []
@@ -144,11 +145,16 @@ def _extract_numeric(data: Dict[str, Any], keys: List[str]) -> Optional[float]:
 
 
 def _parse_clean_float(val_str: str) -> float:
-    if not val_str:
+    if val_str is None:
         return 0.0
-    cleaned = re.sub(r"[^\d.-]", "", str(val_str))
+    raw = str(val_str).strip()
+    if not raw or raw in {"-", "—", "–"}:
+        return 0.0
+    accounting_negative = raw.startswith("(") and raw.endswith(")")
+    cleaned = re.sub(r"[^\d.-]", "", raw)
     try:
-        return float(cleaned) if cleaned not in ("", "-", ".") else 0.0
+        value = float(cleaned) if cleaned not in ("", "-", ".") else 0.0
+        return -abs(value) if accounting_negative else value
     except ValueError:
         return 0.0
 
@@ -201,13 +207,18 @@ async def fetch_real_fundamentals_online(
     symbol: str, company_name: str, country: str, live_price: float, closes_3y: List[float]
 ) -> Dict[str, Any]:
     clean = symbol.strip().upper()
+    cache_key = f"{country.upper()}:{clean}"
     wacc_info = compute_stock_specific_wacc(country, closes_3y)
 
-    if clean in FUNDAMENTALS_CACHE:
-        cached = FUNDAMENTALS_CACHE[clean].copy()
-        cached["wacc"] = wacc_info["wacc"]
-        cached["beta"] = wacc_info["beta"]
-        return cached
+    if cache_key in FUNDAMENTALS_CACHE:
+        cached_entry = FUNDAMENTALS_CACHE[cache_key]
+        cached_at = float(cached_entry.get("_cached_at", 0.0) or 0.0)
+        if time_mod.time() - cached_at < FUNDAMENTALS_CACHE_TTL_SECONDS:
+            cached = {k: v for k, v in cached_entry.items() if k != "_cached_at"}
+            cached["wacc"] = wacc_info["wacc"]
+            cached["beta"] = wacc_info["beta"]
+            return cached
+        FUNDAMENTALS_CACHE.pop(cache_key, None)
 
     client = get_http_client()
     pe_val: Optional[float] = None
@@ -231,6 +242,7 @@ async def fetch_real_fundamentals_online(
                         return _parse_clean_float(m.group(1)) if m else None
 
                     pe_val = _grab_screener_num(r"Stock P/E")
+                    eps_val = _grab_screener_num(r"EPS")
                     roic_val = _grab_screener_num(r"ROCE")
                     roe_val = _grab_screener_num(r"ROE")
                     book_val = _grab_screener_num(r"Book Value")
@@ -285,48 +297,31 @@ async def fetch_real_fundamentals_online(
     ema_200 = sum(closes_3y[-min(200, len(closes_3y)) :]) / min(200, len(closes_3y))
     price_to_200 = live_price / max(0.01, ema_200)
 
-    # CRITICAL BANK/NBFC FIX:
-    # For Banks & Financials, Screener reports low ROCE (~6-7%) because deposits count as debt,
-    # whereas ROE (13.6% - 18%) is the true return on capital. Always use max(ROCE, ROE) for Banks/Financials!
+    # Do not manufacture EPS, P/E, ROIC or ROE from price momentum/volatility.
+    # Such synthetic values made the dashboard look complete but could produce
+    # false valuation multiples and misleading BUY/SELL signals.
     upper_ident = f"{clean} {company_name.upper()}"
     is_bank_or_fin = any(w in upper_ident for w in ("BANK", "FIN", "NBFC", "CAPITAL", "HOUSING", "INSURANCE"))
+    if is_bank_or_fin and roe_val is not None and roic_val is not None:
+        # Keep reported ROCE and ROE separate; ROE is not ROIC/WACC.
+        pass
 
-    if is_bank_or_fin and roe_val is not None:
-        roic_val = max(roic_val or 0.0, roe_val)
-    elif roic_val is None and roe_val is not None:
-        roic_val = round(roe_val * 0.92, 2)
-    elif roic_val is None:
-        sharpe_proxy = cagr_3y / max(11.0, ann_vol_pct)
-        roic_val = round(max(5.5, min(38.5, 11.5 + (sharpe_proxy * 6.5) + (cagr_3y * 0.18) - (wacc_info["beta"] * 0.9))), 2)
-
-    if roe_val is None:
-        roe_val = round(roic_val * 1.06, 2)
-
-    # If a company is a Bank/NBFC with low beta/steady deposits, cap its effective cost of capital
-    if is_bank_or_fin:
-        wacc_info["wacc"] = round(min(wacc_info["wacc"], 11.20 if country == "IN" else 9.20), 2)
-
-    if pe_val is None and eps_val is not None and eps_val > 0:
-        pe_val = round(live_price / eps_val, 1)
-    if pe_val is None:
-        base_mult = 14.5 + max(-5.0, min(20.0, cagr_3y * 0.42)) + ((price_to_200 - 1.0) * 14.5) - (ann_vol_pct * 0.08)
-        pe_val = round(max(7.5, min(62.0, base_mult)), 1)
-
-    if eps_val is None and pe_val > 0:
-        eps_val = round(live_price / pe_val, 2)
-
+    fundamentals_verified = all(v is not None for v in (pe_val, eps_val, roic_val, roe_val)) and source_tag != "QUANT_MODEL"
     out = {
-        "pe": round(pe_val, 1),
-        "eps": round(eps_val, 2) if eps_val is not None else round(live_price / 18.2, 2),
-        "roic": round(roic_val, 2),
-        "roe": round(roe_val, 2),
+        "pe": round(pe_val, 2) if pe_val is not None else None,
+        "eps": round(eps_val, 2) if eps_val is not None else None,
+        "roic": round(roic_val, 2) if roic_val is not None else None,
+        "roe": round(roe_val, 2) if roe_val is not None else None,
         "wacc": wacc_info["wacc"],
         "beta": wacc_info["beta"],
-        "book_value": round(book_val, 2) if book_val else None,
-        "source": source_tag,
+        "book_value": round(book_val, 2) if book_val is not None else None,
+        "source": source_tag if source_tag != "QUANT_MODEL" else "UNVERIFIED / NO FUNDAMENTAL SOURCE",
+        "fundamentals_verified": fundamentals_verified,
+        "fundamentals_missing": [name for name, value in (("P/E", pe_val), ("EPS", eps_val), ("ROCE/ROIC", roic_val), ("ROE", roe_val)) if value is None],
+        "_cached_at": time_mod.time(),
     }
-    FUNDAMENTALS_CACHE[clean] = out
-    return out
+    FUNDAMENTALS_CACHE[cache_key] = out
+    return {k: v for k, v in out.items() if k != "_cached_at"}
 
 
 # ============================================================================
@@ -421,6 +416,8 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
     # Instruments is the authoritative holdings table. Do not parse Transactions
     # as positions if this table has valid holdings.
     instruments_imported = 0
+    instruments_sheet_readable = False
+    cost_i = -1
     transactions_text = None
     for sheet_name, csv_url in urls:
         try:
@@ -446,7 +443,8 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
             hi, heads, sym_i, qty_i = header_index(rows)
             if hi < 0:
                 continue
-            cost_i = next((i for i, h in enumerate(heads) if "avg buy cost" in h or h in ("avg buy price", "average buy price", "avg cost")), -1)
+            instruments_sheet_readable = True
+            cost_i = next((i for i, h in enumerate(heads) if "avg buy cost" in h or "avg buy price" in h or h in ("average buy price", "avg cost")), -1)
             company_i = next((i for i, h in enumerate(heads) if h in ("company (for stocks)", "company", "name")), -1)
             parsed = []
             for row in rows[hi + 1:]:
@@ -475,7 +473,7 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
     # If Instruments cannot be read, reconstruct current quantity and weighted
     # average cost from BUY/SELL transaction rows. SELL reduces quantity but
     # does not alter remaining units' average cost (average-cost accounting).
-    if instruments_imported == 0 and transactions_text:
+    if instruments_imported == 0 and not instruments_sheet_readable and transactions_text:
         try:
             rows = list(csv.reader(io.StringIO(transactions_text)))
             tx_header = -1
@@ -522,7 +520,15 @@ async def sync_portfolio_and_token_from_gsheet(sheet_url: Optional[str] = None) 
         except Exception:
             pass
 
-    return {"token_updated": token_updated, "positions_imported": instruments_imported, "watchlist_imported": watchlist_imported, "source": "Instruments" if instruments_imported else ("Transactions" if transactions_text else "none")}
+    return {
+        "token_updated": token_updated,
+        "positions_imported": instruments_imported,
+        "watchlist_imported": watchlist_imported,
+        "source": "Instruments" if instruments_imported else ("Instruments (no active positions)" if instruments_sheet_readable else ("Transactions" if transactions_text else "none")),
+        "instruments_sheet_readable": instruments_sheet_readable,
+        "cost_column_found": cost_i >= 0 if "cost_i" in locals() else False,
+        "portfolio_cost_basis_missing": sum(1 for p in PORTFOLIO_STORE if not float(p.get("avg_buy_price") or 0) > 0),
+    }
 
 
 async def periodic_12hr_sync_loop() -> None:
@@ -753,9 +759,10 @@ def run_daily_frame_signal_audit(
     last_logged_sig = ""
     last_logged_idx = -999
 
-    is_fundamentally_profitable = (eps > 0) and (stock_roic >= wacc * 0.85)
-    current_price = closes[-1]
-    base_earnings_fv = (eps * justified_pe) if eps > 0 else current_price
+    # Historical signals must not reuse today's EPS/ROIC/WACC/justified P/E.
+    # Those values were not necessarily known at each historical date, so the
+    # backtest below is deliberately price-only and must not be marketed as a
+    # point-in-time fundamental backtest.
 
     fwd_30_offset = 21 if n >= 95 else max(3, (n - 15) // 3)
     fwd_60_offset = 43 if n >= 95 else max(6, (n - 15) // 2)
@@ -784,11 +791,9 @@ def run_daily_frame_signal_audit(
             pit_safe_buy = round(pit_fv * 0.94, 2)
             pit_sell_trig = round(pit_fv * 1.14, 2)
         else:
-            # Scale historical earnings power proportionally to the 200-EMA trajectory
-            hist_scale = e200 / max(0.01, ema200_all[-1])
-            pit_earn_fv = base_earnings_fv * hist_scale
+            # Historical reference value uses only information available by bar i.
             band_anchor = (h_52w * 0.60) + (e200 * 0.40)
-            raw_pit_fv = (pit_earn_fv * 0.60) + (band_anchor * 0.40) if is_fundamentally_profitable else (e200 * 0.85)
+            raw_pit_fv = (e200 * 0.65) + (band_anchor * 0.35)
             pit_fv = round(max(p * 0.55, min(p * 1.48, raw_pit_fv)), 2)
             pit_safe_buy = round(pit_fv * 0.88, 2)
             pit_sell_trig = round(pit_fv * 1.18, 2)
@@ -796,10 +801,7 @@ def run_daily_frame_signal_audit(
         # Pure Fundamental + Technical Signal on Day i
         is_stabilized = (p >= e20) or (rsi_val >= 40.0 and p >= p_5d_ago * 0.99)
 
-        if not is_etf and (not is_fundamentally_profitable) and p < e200 * 0.92 and p < p_start * 0.82:
-            sig = "SELL / EXIT (Weak Business)"
-            sig_type = "SELL"
-        elif p >= pit_sell_trig or rsi_val >= 73.0:
+        if (p < e200 * 0.92 and p < p_start * 0.82) or p >= pit_sell_trig or rsi_val >= 73.0:
             sig = "SELL / BOOK PROFIT"
             sig_type = "SELL"
         elif p <= pit_safe_buy and is_stabilized:
@@ -808,8 +810,8 @@ def run_daily_frame_signal_audit(
         elif p <= pit_fv and is_stabilized:
             sig = "BUY / ACCUMULATE"
             sig_type = "BUY"
-        elif is_fundamentally_profitable and p <= pit_fv * 1.05 and p >= e20 and e20 >= e50 and (46.0 <= rsi_val <= 66.0):
-            sig = "BUY (GARP)"
+        elif p <= pit_fv * 1.05 and p >= e20 and e20 >= e50 and (46.0 <= rsi_val <= 66.0):
+            sig = "BUY (TREND / VALUE PROXY)"
             sig_type = "BUY"
         else:
             # Skip logging passive HOLD/WAIT unless no actionable signals exist
@@ -889,14 +891,15 @@ def run_daily_frame_signal_audit(
     total_sigs = len(recent_log)
     correct_sigs = sum(1 for x in recent_log if x["is_correct"])
     wrong_sigs = total_sigs - correct_sigs
-    win_rate = round((correct_sigs / total_sigs) * 100.0, 1) if total_sigs > 0 else 75.0
+    win_rate = round((correct_sigs / total_sigs) * 100.0, 1) if total_sigs > 0 else 0.0
     directional_rets = [x["effective_return_pct"] for x in recent_log]
     avg_ret = round(sum(directional_rets) / len(directional_rets), 2) if directional_rets else 0.0
 
     return {
         "win_rate_pct": win_rate,
         "avg_return_pct": avg_ret,
-        "backtest_status": "OK_DIRECTIONAL_ENDPOINT_ONLY",
+        "backtest_status": "OK_PRICE_ONLY_NO_LOOKAHEAD",
+        "backtest_method": "Price-only historical signals; current fundamentals are excluded to avoid look-ahead bias.",
         "signals_count": total_sigs,
         "correct_count": correct_sigs,
         "wrong_count": wrong_sigs,
@@ -962,13 +965,14 @@ def evaluate_institutional_engine(
     drop_from_high_pct = round(((high_52w - price) / high_52w * 100.0), 1) if high_52w > 0 else 0.0
     bounce_from_low_pct = round(((price - low_52w) / low_52w * 100.0), 1) if low_52w > 0 else 0.0
 
-    wacc = float(real_fundamentals["wacc"])
-    beta_val = float(real_fundamentals.get("beta", 1.0))
-    eff_roic = float(real_fundamentals["roic"])
-    eff_roe = float(real_fundamentals["roe"])
-    implied_pe = float(real_fundamentals["pe"])
-    eps = float(real_fundamentals["eps"])
-    fund_source = real_fundamentals["source"]
+    wacc = float(real_fundamentals.get("wacc") or 0.0)
+    beta_val = float(real_fundamentals.get("beta") or 1.0)
+    eff_roic = float(real_fundamentals.get("roic") or 0.0)
+    eff_roe = float(real_fundamentals.get("roe") or 0.0)
+    implied_pe = float(real_fundamentals.get("pe") or 0.0)
+    eps = float(real_fundamentals.get("eps") or 0.0)
+    fund_source = real_fundamentals.get("source", "UNVERIFIED")
+    fundamentals_verified = bool(real_fundamentals.get("fundamentals_verified", False))
 
     justified_pe = min(28.0, max(12.0, 15.0 + max(-4.0, (eff_roic - wacc) * 0.65) + max(0.0, min(10.0, cagr_3yr_pct * 0.20))))
     bt_stats = run_daily_frame_signal_audit(closes_3y, timestamps_3y, is_etf, curr_sym, eff_roic, wacc, eps, justified_pe)
@@ -1028,22 +1032,26 @@ def evaluate_institutional_engine(
 
         # 2. Compute Intrinsic Fair Value from Justified Earnings Power + Structural Anchor
         structural_anchor = (high_52w * 0.60) + (ema_200 * 0.40)
-        if eps > 0:
+        if fundamentals_verified and eps > 0:
             earnings_fv = eps * justified_pe
             if implied_pe > 52.0:
                 raw_stock_fv = (earnings_fv * 0.75) + (ema_200 * 0.25)
             else:
                 raw_stock_fv = (earnings_fv * 0.65) + (structural_anchor * 0.35)
             eps_display = f"EPS: {eps} | P/E: {implied_pe}x ({fund_source})"
-        else:
+        elif fundamentals_verified and eps <= 0:
             raw_stock_fv = min(ema_200 * 0.78, low_52w * 0.90)
-            eps_display = f"EPS: {eps} (Loss-Making)"
+            eps_display = f"EPS: {eps} (Reported loss-making; verify financial period)"
+        else:
+            # Technical reference only, not an intrinsic valuation.
+            raw_stock_fv = ema_200
+            eps_display = f"EPS: N/A | P/E: {implied_pe}x" if implied_pe > 0 else "EPS: N/A | P/E: N/A"
 
         fair_value = round(max(price * 0.55, min(price * 1.48, raw_stock_fv)), 2)
         safe_buy_limit = round(min(fair_value - 0.01, fair_value * 0.88), 2)
         sell_trigger_limit = round(max(fair_value + 0.01, fair_value * 1.22), 2)
         mos_pct = round(((fair_value - price) / fair_value) * 100.0, 1) if fair_value > 0 else 0.0
-        quality_badge = f"ROIC: {eff_roic}% vs WACC: {wacc}% (Beta {beta_val}) | P/E: {implied_pe}x"
+        quality_badge = (f"ROCE/ROIC: {eff_roic}% vs cost-of-capital proxy {wacc}% | P/E: {implied_pe}x" if fundamentals_verified else "Fundamentals unverified — technical reference only")
 
         # 3. True "Doobti Company" (Sinking Business) Definition:
         #    ONLY when fundamentals are actually broken (EPS <= 0 OR ROIC < 0.75 * WACC) AND multi-year trend is negative!
@@ -1061,7 +1069,12 @@ def evaluate_institutional_engine(
             and (change_pct < -1.0)
         )
 
-        if is_sinking_company:
+        if not fundamentals_verified:
+            short_signal = "HOLD / FUNDAMENTALS UNVERIFIED"
+            action_badge = "⚪ HOLD / DATA INCOMPLETE (P/E, EPS, ROCE/ROIC aur ROE verify nahi hue — signal ko investment recommendation na samjhein)"
+            lt_confidence = 0.0
+            decision_category = "HOLD"
+        elif is_sinking_company:
             short_signal = "SELL / EXIT"
             action_badge = "🚨 SELL / EXIT (Declining Business & Weak ROIC/Earnings — Doobti Company!)"
             lt_confidence = 20.0
@@ -1097,7 +1110,15 @@ def evaluate_institutional_engine(
             lt_confidence = 76.0
             decision_category = "HOLD"
 
-        if decision_category == "BUY":
+        if not fundamentals_verified:
+            lt_top_5_reasons = [
+                f"1. Fundamental data incomplete: {', '.join(real_fundamentals.get('fundamentals_missing', [])) or 'source validation missing'}; no fundamental BUY/SELL recommendation is issued.",
+                f"2. Price trend only: price {curr_sym}{price}, EMA20 {curr_sym}{ema_20}, EMA50 {curr_sym}{ema_50}, EMA200 {curr_sym}{ema_200}.",
+                f"3. Momentum only: RSI(14) {rsi_14}, MACD histogram {macd_hist}; technical context is not intrinsic value.",
+                f"4. Backtest: {bt_stats['signals_count']} completed actionable signals; win rate {bt_stats['win_rate_pct']}% ({bt_stats['backtest_status']}).",
+                "5. Action: verify current-period financial statements and source timestamps before relying on valuation signals.",
+            ]
+        elif decision_category == "BUY":
             lt_top_5_reasons = [
                 f"1. Valuation & Margin of Safety: Live Price ({curr_sym}{price}) iske Intrinsic Fair Value ({curr_sym}{fair_value}) ke {'neeche saste zone mein' if price <= fair_value else 'paas GARP zone mein'} hai (+{mos_pct}% Margin of Safety), aur Long-Term Profit Target {curr_sym}{sell_trigger_limit} hai.",
                 f"2. Strong Business Quality (ROIC vs WACC & P/E): Company ka Return on Capital ({eff_roic}%, ROE: {eff_roe}%) uske Cost of Capital (WACC: {wacc}%, Beta: {beta_val}) se upar hai ({eps_display}), yaani business har saal asli wealth bana raha hai.",
@@ -1196,7 +1217,12 @@ def evaluate_institutional_engine(
         "quality_badge": quality_badge,
         "wacc_pct": wacc,
         "roic_pct": eff_roic,
-        "pe_ratio": implied_pe,
+        "pe_ratio": implied_pe if implied_pe > 0 else None,
+        "fundamentals_verified": fundamentals_verified,
+        "fundamentals_source": fund_source,
+        "fundamentals_missing": real_fundamentals.get("fundamentals_missing", []),
+        "roic_metric_note": "Indian Screener ROCE is used as a ROIC proxy when present; it is not identical to ROIC.",
+        "wacc_method_note": "Heuristic cost-of-capital proxy based on volatility-derived beta; not a fully capital-structure-weighted WACC.",
         "beta": beta_val,
         "high_52w": high_52w,
         "low_52w": low_52w,
@@ -1232,7 +1258,7 @@ def evaluate_institutional_engine(
 
 
 # ============================================================================
-# 6. 10,000 STOCKS & 500 ETFs MATHEMATICAL & SIGNAL AUDIT ENGINE
+# 6. SYNTHETIC SCALE STRESS TEST (NOT LIVE MARKET DATA)
 # ============================================================================
 
 def run_10500_universe_stress_test() -> Dict[str, Any]:
@@ -1289,6 +1315,9 @@ def run_10500_universe_stress_test() -> Dict[str, Any]:
 
     return {
         "audited_at": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M:%S UTC"),
+        "test_type": "SYNTHETIC_STRESS_TEST_NOT_LIVE_MARKET_BACKTEST",
+        "real_market_data_used": False,
+        "historical_backtest_run": False,
         "total_instruments_tested": n_stocks + n_etfs,
         "stocks_tested": n_stocks,
         "etfs_tested": n_etfs,
@@ -1620,11 +1649,17 @@ async def build_filtered_universe(market_filter: str, force_refresh: bool = Fals
     return items
 
 
+async def initial_portfolio_sync() -> None:
+    # Run sheet import first so it establishes quantities/cost basis before Dhan
+    # holdings are merged; concurrent startup writes previously raced each other.
+    await sync_portfolio_and_token_from_gsheet()
+    await sync_dhan_live_holdings_into_portfolio()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(load_dhan_scrip_master_once())
-    asyncio.create_task(sync_dhan_live_holdings_into_portfolio())
-    asyncio.create_task(sync_portfolio_and_token_from_gsheet())
+    asyncio.create_task(initial_portfolio_sync())
     asyncio.create_task(periodic_12hr_sync_loop())
     asyncio.create_task(build_filtered_universe("ALL", force_refresh=False))
     yield
@@ -1637,7 +1672,7 @@ async def lifespan(app: FastAPI):
 # ============================================================================
 
 app = FastAPI(
-    title="Institutional Fund Manager, Pure Fundamental Logic & 10,500-Audited AI",
+    title="Institutional Fund Manager, Pure Fundamental Logic & 10,500-Scale Stress-Test AI",
     version="21.0.0-pure-fund-manager",
     lifespan=lifespan,
 )
@@ -1733,10 +1768,10 @@ async def get_live_universe(
     sw_healthy = [i for i in sw_ranked_all if "AVOID" not in i["sw_state"]]
     sw_top15 = (sw_healthy + [i for i in sw_ranked_all if i not in sw_healthy])[:15]
 
+    backtests_with_signals = [x["backtest"] for x in lt_top15 if x.get("backtest", {}).get("signals_count", 0) > 0]
     avg_bt_win = (
-        round(sum(x["backtest"]["win_rate_pct"] for x in lt_top15) / len(lt_top15), 1)
-        if lt_top15
-        else 75.0
+        round(sum(x["win_rate_pct"] for x in backtests_with_signals) / len(backtests_with_signals), 1)
+        if backtests_with_signals else None
     )
 
     return {
@@ -2238,7 +2273,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
         const totalActive = out.total_portfolio_holdings || 0;
         showToast(`✓ Synced! Sheet Positions: ${importedPos} | Dhan Positions: ${out.dhan_holdings_synced} | Total Active Portfolio: ${totalActive}`);
         refreshCounts();
+        await renderPortfolio(); // refresh visible quantities/cost basis/P&L immediately after sync
         loadUniverse(true);
+      } else {
+        let detail = 'Portfolio sync failed.';
+        try { const err = await res.json(); detail = err.detail || detail; } catch (_) {}
+        showToast(`⚠ ${detail}`);
       }
     }
 
@@ -2278,7 +2318,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       LIVE_UNIVERSE = data.universe || [];
       window.LATEST_LT_TOP15 = data.long_term_top_15 || [];
       window.LATEST_SW_TOP15 = data.swing_trading_top_15 || [];
-      window.AVG_BT_WIN = data.avg_backtest_win_rate_pct || 75.0;
+      window.AVG_BT_WIN = (data.avg_backtest_win_rate_pct == null ? null : data.avg_backtest_win_rate_pct);
 
       document.getElementById('badge-in-session').innerText = `🇮🇳 NSE/BSE: ${data.india_session.status_label}`;
       document.getElementById('badge-us-session').innerText = `🇺🇸 US: ${data.us_session.status_label}`;
@@ -2322,8 +2362,8 @@ FRONTEND_HTML = """<!DOCTYPE html>
         </div>
         <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
           <div class="text-xs text-slate-400">📅 Actionable BUY/SELL Win Rate</div>
-          <div class="text-2xl font-bold text-purple-400 mt-1 font-mono">${window.AVG_BT_WIN || 75.0}%</div>
-          <div class="text-[11px] text-slate-400 mt-0.5">Verified on 30D &amp; 60D Outcomes</div>
+          <div class="text-2xl font-bold text-purple-400 mt-1 font-mono">${window.AVG_BT_WIN == null ? 'N/A' : `${window.AVG_BT_WIN}%`}</div>
+          <div class="text-[11px] text-slate-400 mt-0.5">Historical directional endpoint test; N/A means no completed signals</div>
         </div>
       `;
 
@@ -2387,7 +2427,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
     function openEvidenceModal(symbol) {
       const s = LIVE_UNIVERSE.find(x => x.symbol === symbol);
       if (!s) return;
-      const bt = s.backtest || {win_rate_pct: 75, correct_count: 3, wrong_count: 1, signals_count: 4, signal_log: []};
+      const bt = s.backtest || {win_rate_pct: 0, correct_count: 0, wrong_count: 0, signals_count: 0, signal_log: [], backtest_status: "NOT_RUN"};
 
       document.getElementById('modalTitleBox').innerHTML = `
         <div class="flex items-center gap-2 flex-wrap">
