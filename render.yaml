@@ -7,7 +7,19 @@ services:
     envVars:
       - key: ENVIRONMENT
         value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DHAN_CLIENT_ID
+        sync: false
+      - key: DHAN_API_KEY
+        sync: false
+      - key: DHAN_API_SECRET
+        sync: false
+      - key: DHAN_ACCESS_TOKEN
+        sync: false
+      - key: PORTFOLIO_GSHEET_URL
+        sync: false
       - key: TAPETIDE_TOKEN
-        value: tpt_rt_5fd4dc6df4e461b1fd56cb9a17b48eda43e830533c526e3dce7c4deb
+        sync: false
       - key: FINNHUB_API_KEY
-        value: dbd2c61r01qutcrq9e3gdbd2c61r01qutcrq9e40
+        sync: false
