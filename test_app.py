@@ -65,42 +65,10 @@ class TestFinancialValidationAndDiscrepancyEngine(unittest.TestCase):
         self.assertEqual(eval_out["decision_category"], "HOLD")
         self.assertIn("Unverified", eval_out["eps_display"])
 
-    def test_institutional_fundamentals_registry_prevents_unverified_on_render(self):
-        closes = [680.0 + (i % 7) * 2.0 for i in range(300)]
-        for sym, name, price in (
-            ("HDFCBANK", "HDFC Bank Limited", 691.20),
-            ("SYNGENE", "Syngene International Limited", 365.85),
-            ("GODREJCP", "Godrej Consumer Products Limited", 845.05),
-            ("UNITDSPR", "United Spirits Limited", 1252.10),
-            ("FINCABLES", "Finolex Cables Limited", 1094.60),
-        ):
-            fund = asyncio.run(
-                platform.fetch_real_fundamentals_online(sym, name, "IN", price, closes)
-            )
-            self.assertTrue(fund["fundamentals_verified"], f"{sym} must be verified via registry fallback")
-            self.assertIsNotNone(fund["pe"])
-            self.assertIsNotNone(fund["eps"])
-            self.assertIsNotNone(fund["roe"])
+    def test_embedded_fundamentals_registry_is_disabled(self):
+        # Production metrics must come from live providers, never bundled snapshots.
+        self.assertEqual(platform.INSTITUTIONAL_FUNDAMENTALS_REGISTRY, {})
 
-            eval_out = platform.evaluate_institutional_engine(
-                symbol=sym,
-                name=name,
-                country="IN",
-                exchange="NSE",
-                currency="INR",
-                asset_type="EQUITY",
-                price=price,
-                prev_close=price * 0.99,
-                change_pct=1.0,
-                closes_3y=closes,
-                timestamps_3y=[],
-                vol_ratio=1.1,
-                real_fundamentals=fund,
-                provider_name="NSE_BSE_LIVE_API",
-            )
-            self.assertTrue(eval_out["fundamentals_verified"])
-            self.assertNotEqual(eval_out["valuation_assumptions"]["valuation_method"], "N/A")
-            self.assertNotIn("Unverified", eval_out["short_signal"])
 
     def test_negative_or_zero_earnings_invalidates_positive_pe(self):
         closes = [200.0 - i * 0.3 for i in range(260)]
@@ -584,8 +552,8 @@ class TestFastAPIEndpointsAndSecurity(unittest.TestCase):
             country="IN",
             live_price=691.20,
             closes_3y=closes,
-            raw_metrics=platform.INSTITUTIONAL_FUNDAMENTALS_REGISTRY["HDFCBANK"],
-            source_tag="VERIFIED_FILINGS_REGISTRY",
+            raw_metrics={"eps": 48.0, "pe": 14.4, "roe": 16.0, "roic": 16.0, "book_value": 300.0},
+            source_tag="TEST_FIXTURE",
         )
         seeded = platform.evaluate_institutional_engine(
             symbol="HDFCBANK",
